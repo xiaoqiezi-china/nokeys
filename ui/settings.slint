@@ -1,0 +1,704 @@
+// Settings toolbox: left rail with pages, right content area.
+
+import { ScrollView } from "std-widgets.slint";
+import { Palette, SButton, SToggle, SSlider, SLineEdit, SChip, SColorField, SLabel, SDimLabel, STitle, SSubTitle, SRow } from "widgets.slint";
+
+export struct EditItem {
+    wheel: int,
+    slot: int,
+    name: string,
+    icon: image,
+    has-icon: bool,
+    is-list-entry: bool,
+    nokeys-id: int,
+}
+
+component SideButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> active: false;
+    in property <int> index: 0;
+    callback clicked(int);
+
+    height: 38px;
+    border-radius: 8px;
+    background: root.active ? #2d313f : (ta.has-hover ? #24262f : transparent);
+
+    Text {
+        text: root.label;
+        color: root.active ? Palette.text : Palette.dim;
+        vertical-alignment: center;
+        x: 14px;
+        width: parent.width - 28px;
+        height: parent.height;
+        font-size: 13px;
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(root.index); }
+        mouse-cursor: pointer;
+    }
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: Palette.line;
+}
+
+component Spacer inherits Rectangle {
+    height: 10px;
+}
+
+export component SettingsWindow inherits Window {
+    title: "No Keys - 设置";
+    width: 920px;
+    height: 640px;
+    background: Palette.bg;
+
+    in-out property <int> page: 0;
+
+    // ---- general ----
+    in property <string> hotkey-label: "未绑定";
+    in-out property <bool> capturing: false;
+    in-out property <int> route-index: 0;      // 0..wheel-count-1 = wheel, last = list
+    in property <int> wheel-count: 1;
+    in-out property <int> theme-index: 0;      // 0 auto, 1 light, 2 dark
+    in-out property <bool> blur-enabled: true;
+    in-out property <float> blur-strength: 0.5;
+    in-out property <string> blur-color: "#1f2430";
+    in property <color> blur-color-c: #1f2430;
+
+    // ---- wheels ----
+    in-out property <int> selected-wheel: 0;
+    in property <[EditItem]> edit-items;
+
+    // ---- list view ----
+    in-out property <bool> list-bg-enabled: false;
+    in-out property <string> list-bg-color: "#1e1e2e";
+    in property <color> list-bg-color-c: #1e1e2e;
+    in-out property <string> list-bg-image: "";
+    in property <bool> list-bg-image-set: false;
+    in-out property <float> list-bg-opacity: 0.5;
+    in-out property <string> card-color: "#22242e";
+    in property <color> card-color-c: #22242e;
+    in-out property <float> card-opacity: 0.85;
+
+    // ---- animation ----
+    in-out property <float> anim-global: 1.0;
+    in-out property <float> anim-fade: 1.0;
+    in-out property <float> anim-slide: 1.0;
+    in-out property <float> anim-hover-fade: 1.0;
+    in-out property <float> anim-hover-scale: 1.0;
+    in-out property <float> anim-stagger: 1.0;
+
+    // ---- data ----
+    in property <string> data-dir: "";
+
+    callback request-capture();
+    callback set-route(int);
+    callback set-theme(int);
+    callback set-blur-enabled(bool);
+    callback set-blur-strength(float);
+    callback set-blur-color(string);
+
+    callback select-wheel(int);
+    callback add-wheel();
+    callback remove-wheel(int);
+    callback set-item-name(int, int, string);
+    callback pick-item-icon(int, int);
+    callback clear-item(int, int);
+    callback add-item(int);
+
+    callback set-list-bg-enabled(bool);
+    callback set-list-bg-color(string);
+    callback pick-list-bg-image();
+    callback clear-list-bg-image();
+    callback set-list-bg-opacity(float);
+    callback set-card-color(string);
+    callback set-card-opacity(float);
+
+    callback set-anim-global(float);
+    callback set-anim-fade(float);
+    callback set-anim-slide(float);
+    callback set-anim-hover-fade(float);
+    callback set-anim-hover-scale(float);
+    callback set-anim-stagger(float);
+
+    callback open-data-dir();
+    callback clear-all();
+    callback preview-wheel();
+    callback preview-list();
+
+    HorizontalLayout {
+        // ---------------- sidebar ----------------
+        Rectangle {
+            width: 190px;
+            background: Palette.panel;
+
+            VerticalLayout {
+                padding: 14px;
+                spacing: 3px;
+
+                HorizontalLayout {
+                    height: 46px;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 8px;
+                        background: Palette.accent;
+                        Text {
+                            text: "N";
+                            color: #ffffff;
+                            font-size: 15px;
+                            font-weight: 800;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    STitle { text: "No Keys"; vertical-alignment: center; }
+                }
+
+                Spacer { height: 8px; }
+
+                SideButton { label: "通用"; index: 0; active: root.page == 0; clicked(p) => { root.page = p; } }
+                SideButton { label: "轮盘"; index: 1; active: root.page == 1; clicked(p) => { root.page = p; } }
+                SideButton { label: "列表视图"; index: 2; active: root.page == 2; clicked(p) => { root.page = p; } }
+                SideButton { label: "动画"; index: 3; active: root.page == 3; clicked(p) => { root.page = p; } }
+                SideButton { label: "数据与清空"; index: 4; active: root.page == 4; clicked(p) => { root.page = p; } }
+
+                Spacer { }
+
+                SButton {
+                    text: "预览轮盘";
+                    primary: true;
+                    clicked => { root.preview-wheel(); }
+                }
+                SButton {
+                    text: "预览列表";
+                    clicked => { root.preview-list(); }
+                }
+            }
+        }
+
+        // ---------------- content ----------------
+        Rectangle {
+            clip: true;
+
+            ScrollView {
+                content-width: self.width;
+                content-height: content.preferred-height;
+
+                content := VerticalLayout {
+                    padding: 22px;
+                    spacing: 4px;
+
+                    // =================== GENERAL ===================
+                    if root.page == 0 : VerticalLayout {
+                        spacing: 4px;
+                        STitle { text: "通用"; }
+                        SDimLabel { text: "全局快捷键、路由与毛玻璃外观。"; }
+                        Spacer { height: 14px; }
+
+                        SRow {
+                            label: "全局快捷键";
+                            Rectangle {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 132px;
+                                        height: 30px;
+                                        border-radius: 7px;
+                                        background: Palette.field;
+                                        border-width: 1px;
+                                        border-color: root.capturing ? Palette.accent : Palette.line;
+                                        Text {
+                                            text: root.capturing ? "请按下按键…" : root.hotkey-label;
+                                            color: root.capturing ? Palette.accent : Palette.text;
+                                            font-size: 13px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    SButton {
+                                        width: 84px;
+                                        text: root.capturing ? "取消" : "改绑";
+                                        primary: root.capturing;
+                                        clicked => { root.request-capture(); }
+                                    }
+                                }
+                            }
+                        }
+
+                        SRow {
+                            label: "快捷键打开";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 6px;
+                                alignment: start;
+                                for n in root.wheel-count : SChip {
+                                    width: 78px;
+                                    text: "轮盘 " + (n + 1);
+                                    selected: root.route-index == n;
+                                    clicked => { root.set-route(n); }
+                                }
+                                SChip {
+                                    width: 92px;
+                                    text: "列表视图";
+                                    selected: root.route-index == root.wheel-count;
+                                    clicked => { root.set-route(root.wheel-count); }
+                                }
+                            }
+                        }
+
+                        SRow {
+                            label: "主题";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 6px;
+                                alignment: start;
+                                SChip { width: 88px; text: "跟随系统"; selected: root.theme-index == 0; clicked => { root.set-theme(0); } }
+                                SChip { width: 70px; text: "浅色"; selected: root.theme-index == 1; clicked => { root.set-theme(1); } }
+                                SChip { width: 70px; text: "深色"; selected: root.theme-index == 2; clicked => { root.set-theme(2); } }
+                            }
+                        }
+
+                        Divider { }
+                        Spacer { height: 6px; }
+                        SSubTitle { text: "毛玻璃"; }
+                        Spacer { height: 4px; }
+
+                        SRow {
+                            label: "启用";
+                            SToggle {
+                                x: 150px;
+                                checked: root.blur-enabled;
+                                toggled(v) => { root.set-blur-enabled(v); }
+                            }
+                        }
+                        SRow {
+                            label: "强度";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: root.blur-strength;
+                                    changed(v) => { root.set-blur-strength(v); }
+                                }
+                                SDimLabel {
+                                    width: 46px;
+                                    text: Math.round(root.blur-strength * 100) + "%";
+                                }
+                            }
+                        }
+                        SRow {
+                            label: "颜色";
+                            SColorField {
+                                x: 150px;
+                                width: 210px;
+                                text: root.blur-color;
+                                swatch: root.blur-color-c;
+                                edited(t) => { root.set-blur-color(t); }
+                            }
+                        }
+                    }
+
+                    // =================== WHEELS ===================
+                    if root.page == 1 : VerticalLayout {
+                        spacing: 4px;
+                        STitle { text: "轮盘"; }
+                        SDimLabel { text: "每个轮盘最多 8 个功能项；少于 8 个时自动均分。轮盘 1 固定带一个“列表视图”项。"; }
+                        Spacer { height: 12px; }
+
+                        HorizontalLayout {
+                            height: 30px;
+                            spacing: 6px;
+                            alignment: start;
+                            for n in root.wheel-count : SChip {
+                                width: 78px;
+                                text: "轮盘 " + (n + 1);
+                                selected: root.selected-wheel == n;
+                                clicked => { root.select-wheel(n); }
+                            }
+                            Rectangle { width: 8px; background: transparent; }
+                            SButton {
+                                width: 76px;
+                                text: "+ 新增";
+                                clicked => { root.add-wheel(); }
+                            }
+                            SButton {
+                                width: 76px;
+                                text: "删除";
+                                danger: true;
+                                enabled: root.wheel-count > 1;
+                                clicked => { root.remove-wheel(root.selected-wheel); }
+                            }
+                        }
+
+                        Spacer { height: 10px; }
+                        Divider { }
+                        Spacer { height: 10px; }
+
+                        for item[i] in root.edit-items : Rectangle {
+                            visible: item.wheel == root.selected-wheel;
+                            height: 46px;
+
+                            Rectangle {
+                                height: 46px;
+                                border-radius: 8px;
+                                background: Palette.card;
+
+                                Rectangle {
+                                    x: 8px;
+                                    y: 8px;
+                                    width: 30px;
+                                    height: 30px;
+                                    border-radius: 8px;
+                                    background: Palette.field;
+                                    border-width: 1px;
+                                    border-color: Palette.line;
+                                    Text {
+                                        text: item.slot + 1;
+                                        color: Palette.dim;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    x: 46px;
+                                    y: 9px;
+                                    width: 28px;
+                                    height: 28px;
+                                    border-radius: 8px;
+                                    background: item.has-icon ? transparent : Palette.field;
+                                    border-width: 1px;
+                                    border-color: Palette.line;
+                                    if item.has-icon : Image {
+                                        width: 100%;
+                                        height: 100%;
+                                        source: item.icon;
+                                        image-fit: contain;
+                                    }
+                                }
+
+                                SLineEdit {
+                                    x: 82px;
+                                    y: 8px;
+                                    width: parent.width - 82px - 220px;
+                                    text: item.name;
+                                    placeholder: item.is-list-entry ? "列表视图" : "功能名称";
+                                    edited(t) => { root.set-item-name(item.wheel, item.slot, t); }
+                                }
+
+                                SDimLabel {
+                                    x: parent.width - 214px;
+                                    width: 96px;
+                                    height: parent.height;
+                                    text: item.is-list-entry ? "— 固定项 —" : "nokeys_" + item.nokeys-id;
+                                    font-size: 11px;
+                                }
+
+                                SButton {
+                                    x: parent.width - 116px;
+                                    y: 8px;
+                                    width: 62px;
+                                    height: 30px;
+                                    text: "图标";
+                                    clicked => { root.pick-item-icon(item.wheel, item.slot); }
+                                }
+                                SButton {
+                                    x: parent.width - 48px;
+                                    y: 8px;
+                                    width: 44px;
+                                    height: 30px;
+                                    text: "清空";
+                                    danger: true;
+                                    clicked => { root.clear-item(item.wheel, item.slot); }
+                                }
+                            }
+                        }
+
+                        if root.edit-items.length == 0 : SDimLabel {
+                            text: "此轮盘还没有功能项，添加后会分配一个新的 nokeys 序号。";
+                        }
+
+                        Spacer { height: 6px; }
+                        SButton {
+                            width: 120px;
+                            text: "+ 添加功能项";
+                            primary: true;
+                            enabled: root.edit-items.length < root.wheel-count * 8;
+                            clicked => { root.add-item(root.selected-wheel); }
+                        }
+                    }
+
+                    // =================== LIST VIEW ===================
+                    if root.page == 2 : VerticalLayout {
+                        spacing: 4px;
+                        STitle { text: "列表视图"; }
+                        SDimLabel { text: "列表视图汇总所有轮盘的功能项。默认背景完全透明，仅显示悬浮小卡片。"; }
+                        Spacer { height: 14px; }
+
+                        SRow {
+                            label: "启用背景";
+                            SToggle {
+                                x: 150px;
+                                checked: root.list-bg-enabled;
+                                toggled(v) => { root.set-list-bg-enabled(v); }
+                            }
+                        }
+                        SRow {
+                            label: "背景颜色";
+                            SColorField {
+                                x: 150px;
+                                width: 210px;
+                                text: root.list-bg-color;
+                                swatch: root.list-bg-color-c;
+                                edited(t) => { root.set-list-bg-color(t); }
+                            }
+                        }
+                        SRow {
+                            label: "背景图片";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 8px;
+                                SDimLabel {
+                                    width: parent.width - 160px;
+                                    text: root.list-bg-image-set ? root.list-bg-image : "未选择";
+                                    overflow: elide;
+                                }
+                                SButton {
+                                    width: 74px;
+                                    text: "选择";
+                                    clicked => { root.pick-list-bg-image(); }
+                                }
+                                SButton {
+                                    width: 62px;
+                                    text: "移除";
+                                    enabled: root.list-bg-image-set;
+                                    clicked => { root.clear-list-bg-image(); }
+                                }
+                            }
+                        }
+                        SRow {
+                            label: "背景透明度";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: root.list-bg-opacity;
+                                    changed(v) => { root.set-list-bg-opacity(v); }
+                                }
+                                SDimLabel {
+                                    width: 46px;
+                                    text: Math.round(root.list-bg-opacity * 100) + "%";
+                                }
+                            }
+                        }
+
+                        Divider { }
+                        Spacer { height: 6px; }
+                        SSubTitle { text: "功能项卡片"; }
+                        Spacer { height: 4px; }
+
+                        SRow {
+                            label: "卡片颜色";
+                            SColorField {
+                                x: 150px;
+                                width: 210px;
+                                text: root.card-color;
+                                swatch: root.card-color-c;
+                                edited(t) => { root.set-card-color(t); }
+                            }
+                        }
+                        SRow {
+                            label: "卡片不透明度";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: root.card-opacity;
+                                    changed(v) => { root.set-card-opacity(v); }
+                                }
+                                SDimLabel {
+                                    width: 46px;
+                                    text: Math.round(root.card-opacity * 100) + "%";
+                                }
+                            }
+                        }
+                    }
+
+                    // =================== ANIMATION ===================
+                    if root.page == 3 : VerticalLayout {
+                        spacing: 4px;
+                        STitle { text: "动画"; }
+                        SDimLabel { text: "全局速度统一缩放所有动画；每个动画还可单独乘以倍数。实际时长 = 基础时长 ÷ (全局 × 倍数)。"; }
+                        Spacer { height: 14px; }
+
+                        SRow {
+                            label: "全局速度";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: (root.anim-global - 0.25) / 3.75;
+                                    changed(v) => { root.set-anim-global(v * 3.75 + 0.25); }
+                                }
+                                SDimLabel {
+                                    width: 46px;
+                                    text: Math.round(root.anim-global * 100) / 100 + "x";
+                                }
+                            }
+                        }
+
+                        Divider { }
+                        Spacer { height: 6px; }
+                        SSubTitle { text: "单独倍数"; }
+                        Spacer { height: 4px; }
+
+                        SRow {
+                            label: "淡入淡出";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: (root.anim-fade - 0.25) / 3.75;
+                                    changed(v) => { root.set-anim-fade(v * 3.75 + 0.25); }
+                                }
+                                SDimLabel { width: 46px; text: Math.round(root.anim-fade * 100) / 100 + "x"; }
+                            }
+                        }
+                        SRow {
+                            label: "位移";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: (root.anim-slide - 0.25) / 3.75;
+                                    changed(v) => { root.set-anim-slide(v * 3.75 + 0.25); }
+                                }
+                                SDimLabel { width: 46px; text: Math.round(root.anim-slide * 100) / 100 + "x"; }
+                            }
+                        }
+                        SRow {
+                            label: "悬停淡出";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: (root.anim-hover-fade - 0.25) / 3.75;
+                                    changed(v) => { root.set-anim-hover-fade(v * 3.75 + 0.25); }
+                                }
+                                SDimLabel { width: 46px; text: Math.round(root.anim-hover-fade * 100) / 100 + "x"; }
+                            }
+                        }
+                        SRow {
+                            label: "悬停放大";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: (root.anim-hover-scale - 0.25) / 3.75;
+                                    changed(v) => { root.set-anim-hover-scale(v * 3.75 + 0.25); }
+                                }
+                                SDimLabel { width: 46px; text: Math.round(root.anim-hover-scale * 100) / 100 + "x"; }
+                            }
+                        }
+                        SRow {
+                            label: "列表依次弹出";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 10px;
+                                SSlider {
+                                    width: parent.width - 56px;
+                                    value: (root.anim-stagger - 0.25) / 3.75;
+                                    changed(v) => { root.set-anim-stagger(v * 3.75 + 0.25); }
+                                }
+                                SDimLabel { width: 46px; text: Math.round(root.anim-stagger * 100) / 100 + "x"; }
+                            }
+                        }
+                    }
+
+                    // =================== DATA ===================
+                    if root.page == 4 : VerticalLayout {
+                        spacing: 4px;
+                        STitle { text: "数据与清空"; }
+                        SDimLabel { text: "配置与会话数据以 JSON 保存在本机，不上传、不导入导出。"; }
+                        Spacer { height: 14px; }
+
+                        SRow {
+                            label: "配置目录";
+                            HorizontalLayout {
+                                x: 150px;
+                                width: parent.width - 150px;
+                                height: parent.height;
+                                spacing: 8px;
+                                SDimLabel { width: parent.width - 100px; text: root.data-dir; overflow: elide; }
+                                SButton {
+                                    width: 88px;
+                                    text: "打开目录";
+                                    clicked => { root.open-data-dir(); }
+                                }
+                            }
+                        }
+
+                        Spacer { height: 10px; }
+                        Divider { }
+                        Spacer { height: 10px; }
+
+                        SSubTitle { text: "危险操作"; }
+                        Spacer { height: 8px; }
+                        SDimLabel {
+                            text: "清空会删除所有轮盘、功能项、图标与全部设置，并注销所有 nokeys 序号。";
+                        }
+                        Spacer { height: 10px; }
+                        SButton {
+                            width: 150px;
+                            text: "清空全部数据";
+                            danger: true;
+                            clicked => { root.clear-all(); }
+                        }
+                    }
+
+                    Spacer { height: 20px; }
+                }
+            }
+        }
+    }
+}
