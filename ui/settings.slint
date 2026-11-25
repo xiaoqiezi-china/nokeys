@@ -94,6 +94,7 @@ export component SettingsWindow inherits Window {
     in property <string> data-dir: "";
 
     callback request-capture();
+    callback cancel-capture();
     callback set-route(int);
     callback set-theme(int);
     callback set-blur-enabled(bool);
@@ -215,7 +216,7 @@ export component SettingsWindow inherits Window {
                                         border-width: 1px;
                                         border-color: root.capturing ? Palette.accent : Palette.line;
                                         Text {
-                                            text: root.capturing ? "请按下按键…" : root.hotkey-label;
+                                            text: root.capturing ? "请按下按键…（Esc 取消）" : root.hotkey-label;
                                             color: root.capturing ? Palette.accent : Palette.text;
                                             font-size: 13px;
                                             horizontal-alignment: center;
@@ -226,7 +227,13 @@ export component SettingsWindow inherits Window {
                                         width: 84px;
                                         text: root.capturing ? "取消" : "改绑";
                                         primary: root.capturing;
-                                        clicked => { root.request-capture(); }
+                                        clicked => {
+                                            if (root.capturing) {
+                                                root.cancel-capture();
+                                            } else {
+                                                root.request-capture();
+                                            }
+                                        }
                                     }
                                 }
                             }

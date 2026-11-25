@@ -209,13 +209,19 @@ pub fn icons_dir() -> PathBuf {
 
 pub fn load() -> Config {
     let path = config_path();
-    match std::fs::read_to_string(&path) {
+    let mut cfg = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
             eprintln!("config parse error ({e}), using defaults");
             Config::default()
         }),
         Err(_) => Config::default(),
+    };
+    // A left/right mouse button would be swallowed before it can reach our own UI,
+    // so such a binding can never be used: fall back to the default chord.
+    if cfg.hotkey.mouse == 0x01 || cfg.hotkey.mouse == 0x02 {
+        cfg.hotkey = Config::default().hotkey;
     }
+    cfg
 }
 
 pub fn save(cfg: &Config) -> std::io::Result<()> {

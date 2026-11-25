@@ -1,6 +1,8 @@
 mod backdrop;
 mod config;
 mod settings_ui;
+#[macro_use]
+mod trace;
 mod hotkey;
 
 slint::include_modules!();
@@ -55,7 +57,18 @@ fn main() -> Result<(), slint::PlatformError> {
         std::env::set_var("SLINT_BACKEND", "winit-software");
     }
 
-    if !claim_single_instance() {
+    if std::env::var("NOKEYS_SELFTEST").is_ok() {
+        #[cfg(debug_assertions)]
+        {
+            let cfg = config::load();
+            for (step, ok) in hotkey::selftest(cfg.hotkey.clone()) {
+                println!("{} {}: {}", if ok { "PASS" } else { "FAIL" }, step, if ok { "" } else { "<-- broken" });
+            }
+        }
+        return Ok(());
+    }
+
+    if std::env::var("NOKEYS_ALLOW_MULTI").is_err() && !claim_single_instance() {
         focus_existing_instance();
         return Ok(());
     }
@@ -189,12 +202,25 @@ fn main() -> Result<(), slint::PlatformError> {
             let ow = overlay_weak.clone();
             let sw = settings_weak.clone();
             let st = state_events.clone();
-            let _ = slint::invoke_from_event_loop(move || {
+            ntrace!("rx ev={ev:?}");
+            let res = slint::invoke_from_event_loop(move || {
                 let ov = ow.upgrade();
                 let se = sw.upgrade();
+                ntrace!("dispatch ev={:?} settings={} overlay={}", ev, se.is_some(), ov.is_some());
+                if matches!(ev, HotkeyEvent::CaptureCancelled) {
+                    if let Some(se) = &se {
+                        let mut state = st.lock().unwrap();
+                        state.capturing = false;
+                        hotkey::set_capturing(false);
+                        drop(state);
+                        sync_settings(se, &st);
+                    }
+                    return;
+                }
                 if let HotkeyEvent::Captured(hk) = ev {
                     if let Some(se) = &se {
                         let mut state = st.lock().unwrap();
+                        ntrace!("captured hk={:?} state.capturing={}", hk, state.capturing);
                         if state.capturing {
                             state.capturing = false;
                             state.config.hotkey = hk;
@@ -210,6 +236,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     handle_event(ev, &ov, &st);
                 }
             });
+            if let Err(e) = res {
+                ntrace!("invoke_from_event_loop failed: {e}");
+            }
         }
     });
 
@@ -248,6 +277,39 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 });
             }
+        });
+    }
+
+    // Diagnostic: report hook liveness from a plain thread (never from the hook).
+    if std::env::var("NOKEYS_TRACE").is_ok() {
+        std::thread::spawn(|| {
+            let mut last = (u32::MAX, u32::MAX, u32::MAX);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let now = (
+                    hotkey::stat_keys(),
+                    hotkey::stat_capture_active(),
+                    hotkey::stat_capture_hits(),
+                );
+                if now != last {
+                    ntrace!("hook stats keys={} cap_active={} cap_hits={}", now.0, now.1, now.2);
+                    last = now;
+                }
+            }
+        });
+    }
+
+    // Refresh the low-level hooks periodically: Windows silently removes a hook
+    // whose callback timed out, and that is otherwise undetectable.
+    {
+        let mut tick = 0u32;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            tick += 1;
+            let _ = slint::invoke_from_event_loop(move || {
+                hotkey::reinstall_hooks();
+                ntrace!("watchdog tick {}", tick);
+            });
         });
     }
 
@@ -486,7 +548,7 @@ fn handle_event(ev: HotkeyEvent, ov: &OverlayWindow, state: &Arc<Mutex<AppState>
                 println!("[nokeys] activate nokeys_{id}");
             }
         }
-        HotkeyEvent::Captured(_) => {
+        HotkeyEvent::Captured(_) | HotkeyEvent::CaptureCancelled => {
             // handled where the settings window is reachable
         }
         HotkeyEvent::Wheel(delta) => {

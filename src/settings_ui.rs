@@ -1,10 +1,12 @@
 // Settings dialog wiring: keeps the Slint properties in sync with the config.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::config::{self, Config, Theme};
+use crate::ntrace;
 use crate::hotkey;
 use crate::{
     apply_animation, apply_theme, is_dark, load_icon, hotkey_label, AppState, EditItem,
@@ -110,6 +112,19 @@ fn commit(settings: &SettingsWindow, overlay: &OverlayWindow, state: &Arc<Mutex<
     refresh_overlay_style(overlay, state);
 }
 
+/// Some Slint builds deliver a single physical click to `clicked` twice; a short
+/// shared gate keeps every button action idempotent without hurting rapid clicking.
+fn click_allowed() -> bool {
+    static LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(1)));
+    let mut last = last.lock().unwrap();
+    if last.elapsed() < Duration::from_millis(180) {
+        return false;
+    }
+    *last = Instant::now();
+    true
+}
+
 /// Copy a user-picked icon next to the config, returning its new path.
 fn copy_icon(path: &std::path::Path) -> std::io::Result<String> {
     let dir = config::icons_dir();
@@ -136,13 +151,31 @@ pub fn wire_settings(
     {
         let st = state.clone();
         let sw = settings.as_weak();
+        // Always *start* capturing (never toggle): a duplicated click event must not
+        // cancel the capture it just started.
         settings.on_request_capture(move || {
-            let capturing = {
-                let mut s = st.lock().unwrap();
-                s.capturing = !s.capturing;
-                s.capturing
-            };
-            hotkey::set_capturing(capturing);
+            if !click_allowed() {
+                return;
+            }
+            st.lock().unwrap().capturing = true;
+            hotkey::set_capturing(true);
+            ntrace!("request_capture -> capturing=true");
+            if let Some(se) = sw.upgrade() {
+                sync_settings(&se, &st);
+            }
+        });
+    }
+
+    {
+        let st = state.clone();
+        let sw = settings.as_weak();
+        settings.on_cancel_capture(move || {
+            if !click_allowed() {
+                return;
+            }
+            st.lock().unwrap().capturing = false;
+            hotkey::set_capturing(false);
+            ntrace!("cancel_capture");
             if let Some(se) = sw.upgrade() {
                 sync_settings(&se, &st);
             }
@@ -240,6 +273,9 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_add_wheel(move || {
+            if !click_allowed() {
+                return;
+            }
             if let Some(se) = sw.upgrade() {
                 {
                     let mut s = st.lock().unwrap();
@@ -260,6 +296,9 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_remove_wheel(move |idx: i32| {
+            if !click_allowed() {
+                return;
+            }
             if let Some(se) = sw.upgrade() {
                 {
                     let mut s = st.lock().unwrap();
@@ -290,6 +329,9 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_add_item(move |wheel: i32| {
+            if !click_allowed() {
+                return;
+            }
             if let Some(se) = sw.upgrade() {
                 {
                     let mut s = st.lock().unwrap();
@@ -358,6 +400,9 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_clear_item(move |wheel: i32, slot: i32| {
+            if !click_allowed() {
+                return;
+            }
             if let Some(se) = sw.upgrade() {
                 {
                     let mut s = st.lock().unwrap();
@@ -519,6 +564,9 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_clear_all(move || {
+            if !click_allowed() {
+                return;
+            }
             let dir = config::config_dir();
             let _ = std::fs::remove_dir_all(&dir);
             {
