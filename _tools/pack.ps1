@@ -10,7 +10,6 @@ Set-Location $root
 
 $version = (Select-String -Path 'Cargo.toml' -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 $app = 'target\release\nokeys.exe'
-$setupBin = 'target\release\setup.exe'
 $dist = 'dist'
 
 if (-not $SkipBuild) {
@@ -20,35 +19,31 @@ if (-not $SkipBuild) {
 }
 
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-foreach ($f in @($app, $setupBin)) {
-    if (-not (Test-Path $f)) { throw "missing $f" }
-}
+if (-not (Test-Path $app)) { throw "missing $app" }
 
-# ---- installer: setup.exe + appended application + trailer ----
-$setup = Join-Path $dist "NoKeys-$version-setup.exe"
-Copy-Item $setupBin $setup -Force
-$payload = [IO.File]::ReadAllBytes((Resolve-Path $app))
-$trailer = New-Object byte[] 16
-[BitConverter]::GetBytes([int64]$payload.Length).CopyTo($trailer, 0)
-[Text.Encoding]::ASCII.GetBytes('NOKEYS01').CopyTo($trailer, 8)
-$stream = [IO.File]::Open($setup, 'Append')
-$stream.Write($payload, 0, $payload.Length)
-$stream.Write($trailer, 0, $trailer.Length)
-$stream.Close()
-
-# verify the package can be parsed back
-$check = [IO.File]::ReadAllBytes($setup)
-$tail = $check[($check.Length - 16)..($check.Length - 1)]
-$size = [BitConverter]::ToInt64($tail, 0)
-$magic = [Text.Encoding]::ASCII.GetString($tail, 8, 8)
-$setupLen = $check.Length - 16 - $size
-if ($magic -ne 'NOKEYS01' -or $size -ne $payload.Length -or $setupLen -le 0) {
-    throw "package trailer is wrong (magic=$magic size=$size)"
+# ---- MSI (WiX 3): standard Windows Installer package ----
+$wixBin = $env:WIX_BIN
+if (-not $wixBin) {
+    foreach ($candidate in @(
+        (Join-Path $env:LOCALAPPDATA 'nokeys-tools\wix\bin'),
+        'C:\Program Files (x86)\WiX Toolset v3.14\bin',
+        'C:\Program Files (x86)\WiX Toolset v3.11\bin'
+    )) {
+        if (Test-Path (Join-Path $candidate 'candle.exe')) { $wixBin = $candidate; break }
+    }
 }
-$sha = [Security.Cryptography.SHA256]::Create()
-$installedApp = $check[$setupLen..($setupLen + $size - 1)]
-if ([BitConverter]::ToString($sha.ComputeHash($installedApp)) -ne [BitConverter]::ToString($sha.ComputeHash($payload))) {
-    throw 'payload copy is corrupted'
+if (-not $wixBin) {
+    Write-Warning 'WiX 3 not found (set WIX_BIN), skipping the MSI'
+} else {
+    $obj = 'build\wix\NoKeys.wixobj'
+    New-Item -ItemType Directory -Force -Path 'build\wix' | Out-Null
+    Push-Location packaging
+    & (Join-Path $wixBin 'candle.exe') -nologo -arch x64 -out "..\$obj" 'NoKeys.wxs'
+    if ($LASTEXITCODE -ne 0) { Pop-Location; throw 'candle failed' }
+    & (Join-Path $wixBin 'light.exe') -nologo -ext WixUIExtension -cultures:zh-CN -out "..\$dist\NoKeys-$version.msi" "..\$obj"
+    $lightExit = $LASTEXITCODE
+    Pop-Location
+    if ($lightExit -ne 0) { throw 'light failed' }
 }
 
 # ---- portable zip ----

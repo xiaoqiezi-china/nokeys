@@ -16,11 +16,11 @@ Windows 上的全局轮盘 / 列表快捷启动器：按住一个热键，在鼠
 
 ## 安装
 
-下载 `NoKeys-<版本>-setup.exe` 双击安装（按当前用户安装，不需要管理员权限）：
-程序装到 `%LOCALAPPDATA%\Programs\NoKeys`，并创建开始菜单与桌面快捷方式。
-卸载：运行该目录下的 `uninstall.exe`，或"设置 → 应用 → 已安装的应用"。
+下载 `NoKeys-<版本>.msi` 双击运行标准的 Windows 安装向导：安装到 `Program Files\NoKeys`，
+创建开始菜单与桌面快捷方式，注册到"应用和功能"，卸载也从那里走（或者再运行一次安装包选"删除"）。
+安装需要管理员授权，安装完成后会自动启动。
 
-便携版：解压 `NoKeys-<版本>-portable.zip`，直接运行 `nokeys.exe`。
+不想安装就用便携版：解压 `NoKeys-<版本>-portable.zip`，直接运行 `nokeys.exe`。
 
 配置与图标保存在 `%APPDATA%\NoKeys`，卸载时不会删除。
 
@@ -40,9 +40,9 @@ Windows 上的全局轮盘 / 列表快捷启动器：按住一个热键，在鼠
 
 ## 从源码构建
 
-需要 Rust（MSVC 工具链）与 Windows SDK（用于嵌入图标和版本信息）。
+需要 Rust（MSVC 工具链）、Windows SDK（嵌入图标和版本信息）以及 WiX 3（生成 MSI）。
 
 ```
 cargo build --release              # target\release\nokeys.exe
-powershell -File _tools\pack.ps1   # dist\ 下生成安装包与便携版
+powershell -File _tools\pack.ps1   # dist\ 下生成 MSI 与便携版（需要 WiX 3，可用 WIX_BIN 指定）
 ```

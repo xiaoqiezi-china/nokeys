@@ -1,5 +1,6 @@
 /target
 /dist
+/build
 *.log
 /_shots
 *.png

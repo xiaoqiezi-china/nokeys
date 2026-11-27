@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Windows Installer package for NoKeys.
+
+     Installs per machine into Program Files\NoKeys, creates a Start Menu entry
+     and a desktop shortcut, registers the usual "apps and features" entry and
+     removes everything again on uninstall. The user's settings in
+     %APPDATA%\NoKeys are deliberately left alone. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="NoKeys"
+           Language="2052"
+           Version="1.0.0"
+           Manufacturer="NoKeys"
+           UpgradeCode="7E4C1F52-9A3B-4D6E-8C21-5F0B7A6D93C4">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="x64"
+             Description="Windows 全局轮盘 / 列表快捷启动器" />
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="已安装更新版本的 NoKeys。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="..\assets\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/xiaoqiezi-china/nokeys" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <UIRef Id="WixUI_InstallDir" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="NoKeys" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppMenuFolder" Name="NoKeys" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="*">
+        <File Id="NoKeysExe"
+              Source="..\target\release\nokeys.exe"
+              KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="AppMenuFolder"
+                    Name="NoKeys"
+                    Description="Windows 全局轮盘快捷启动器"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Advertise="yes" />
+          <Shortcut Id="DesktopShortcut"
+                    Directory="DesktopFolder"
+                    Name="NoKeys"
+                    Description="Windows 全局轮盘快捷启动器"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Advertise="yes" />
+        </File>
+        <!-- the Start Menu folder is ours alone, so uninstall has to remove it -->
+        <RemoveFolder Id="AppMenuFolderRemove" Directory="AppMenuFolder" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="NoKeys" Level="1" Absent="disallow">
+      <ComponentRef Id="MainExecutable" />
+    </Feature>
+
+    <!-- Start the tray app once the files are in place; Impersonate keeps it in
+         the installing user's session instead of the elevated one. -->
+    <CustomAction Id="LaunchApp"
+                  FileKey="NoKeysExe"
+                  ExeCommand=""
+                  Impersonate="yes"
+                  Return="asyncNoWait" />
+    <InstallExecuteSequence>
+      <Custom Action="LaunchApp" After="InstallFinalize">NOT Installed AND NOT REMOVE</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>
