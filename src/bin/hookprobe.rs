@@ -107,7 +107,7 @@ fn last_input_age_ms() -> u32 {
             dwTime: 0,
         };
         if GetLastInputInfo(&mut li).as_bool() {
-            let now = unsafe { get_tick_count() };
+            let now = get_tick_count();
             now.wrapping_sub(li.dwTime)
         } else {
             u32::MAX

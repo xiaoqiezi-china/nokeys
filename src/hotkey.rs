@@ -1,332 +1,220 @@
+// Global hotkey handling.
+//
+// There are exactly three moving parts, each with one job:
+//
+//  * A polling thread reading GetAsyncKeyState is the ONLY source of the
+//    trigger. It reports one Down when the chord becomes fully pressed and one
+//    Up when any part of it is released. Because a single thread owns the
+//    edges, the rest of the program can never observe a duplicated or dropped
+//    press, no matter what the hooks do.
+//  * The low-level hooks never emit trigger events. They only swallow the chord
+//    so the foreground application never sees it, swallow the rest of the
+//    keyboard while the overlay is engaged, and forward wheel deltas (which
+//    polling cannot observe).
+// Exactly one of those two paths may own the trigger at a time, because a hook
+// that swallows the chord also keeps it out of the async key state: the poller
+// watches a heartbeat from the hooks and stands down while they are alive.
+// RegisterHotKey is deliberately NOT used: it can consume the chord without the
+// application ever seeing a matching key-up, which leaves the overlay stuck open.
+//
+// Rebinding is handled by the same poller: it watches for key edges and turns
+// the first acceptable one into Captured.
+
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_CONTROL, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN, VK_SHIFT,
-    VK_XBUTTON1, VK_XBUTTON2,
+    GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, WPARAM as WP};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, RegisterClassW,
-    KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, SetWindowsHookExW, UnhookWindowsHookEx,
-    CW_USEDEFAULT, HHOOK, HWND_MESSAGE,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WNDCLASSW, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
-    MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+    CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    MSLLHOOKSTRUCT, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP,
+    WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::config::Hotkey;
 
-/// Events emitted by the global hotkey hook.
+/// Events produced by the hotkey layer. All of them originate from the polling
+/// thread, except Wheel, which comes from the mouse hook.
 #[derive(Debug, Clone, Copy)]
 pub enum HotkeyEvent {
-    /// Hotkey chord became fully pressed (open overlay).
+    /// The chord became fully pressed.
     Down,
-    /// Hotkey released.
+    /// Any part of the chord was released.
     Up,
-    /// Mouse wheel delta while the overlay is engaged (for wheel switching).
+    /// Mouse wheel delta while the overlay is engaged (wheel switching).
     Wheel(i32),
-    /// A candidate hotkey captured while the settings dialog is rebinding.
+    /// A new hotkey was captured during rebinding.
     Captured(Hotkey),
-    /// Rebinding aborted (Esc).
+    /// Rebinding was aborted with Esc (or timed out).
     CaptureCancelled,
+    /// A key that cannot be used as a hotkey was pressed while rebinding.
+    /// 1 = needs a modifier, 2 = that button is reserved for normal use.
+    CaptureRejected(u8),
 }
 
-struct HookState {
-    engaged: bool,
-    hotkey: Hotkey,
-    tx: Sender<HotkeyEvent>,
-    // modifier states tracked from the hook stream itself
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    win: bool,
-    // rebinding mode: report the next chord and swallow everything
-    capturing: bool,
-    capture_started: std::time::Instant,
-    debug: bool,
-}
+// ----- chord, kept in atomics so both the poller and the hooks can read it
+// without ever taking a lock (a hook callback must not block) -----
+const M_CTRL: u32 = 1;
+const M_ALT: u32 = 2;
+const M_SHIFT: u32 = 4;
+const M_WIN: u32 = 8;
 
-impl HookState {
-    fn mods_match(&self, h: &Hotkey) -> bool {
-        self.ctrl == h.ctrl && self.alt == h.alt && self.shift == h.shift && self.win == h.win
-    }
+static MODS: AtomicU32 = AtomicU32::new(0);
+static KEY_VK: AtomicU32 = AtomicU32::new(0);
+static MOUSE_VK: AtomicU32 = AtomicU32::new(0);
+/// 1 while the chord is held down; guards the Down/Up edges.
+static HELD: AtomicU32 = AtomicU32::new(0);
+/// 1 while presses must be ignored until the chord is seen released again.
+/// Set after a rebind, where the keys that produced the chord are still down.
+/// It can only ever delay one press: every observed chord-up clears it.
+static SUPPRESS: AtomicU32 = AtomicU32::new(0);
+/// 1 while the overlay is on screen because of the hotkey, which is the only
+/// situation in which the rest of the keyboard is taken away from the user.
+/// Driven by the UI and never by internal state, so it cannot get stuck: the
+/// worst case is that the overlay is still visible while it is set.
+static SWALLOW: AtomicU32 = AtomicU32::new(0);
 
-    fn snapshot(&self, key: u32, mouse: u32) -> Hotkey {
-        Hotkey {
-            ctrl: self.ctrl,
-            alt: self.alt,
-            shift: self.shift,
-            win: self.win,
-            key,
-            mouse,
-        }
-    }
-}
+/// 1 while the settings dialog is rebinding.
+static CAPTURING: AtomicU32 = AtomicU32::new(0);
+/// Bumped on every capture start so the poller can re-seed its edge detector.
+static CAPTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-static HOOK_STATE: OnceLock<Mutex<HookState>> = OnceLock::new();
-
-// Lock-free counters so the UI thread can verify hook liveness without the hook
-// ever performing I/O.
+static EVENT_TX: OnceLock<Sender<HotkeyEvent>> = OnceLock::new();
 static KB_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MS_HOOK: AtomicIsize = AtomicIsize::new(0);
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
-// The low-level keyboard hook proved unreliable on some Windows setups (the OS
-// silently drops it), so the primary trigger is a system-wide RegisterHotKey on a
-// hidden message-only window, with a polling thread detecting the key release.
-static TRIGGER_HWND: AtomicIsize = AtomicIsize::new(0);
-static TRIGGER_ACTIVE: AtomicU32 = AtomicU32::new(0);
-static TRIGGER_HELD: AtomicU32 = AtomicU32::new(0);
-static TRIGGER_VK: AtomicU32 = AtomicU32::new(0);
-static EVENT_TX: OnceLock<Sender<HotkeyEvent>> = OnceLock::new();
-
+// Liveness counters for the diagnostics thread; never do file I/O from a hook.
 static STAT_KEYS: AtomicU32 = AtomicU32::new(0);
-static STAT_CAPTURE_ACTIVE: AtomicU32 = AtomicU32::new(0);
+static STAT_MOUSE: AtomicU32 = AtomicU32::new(0);
+static STAT_SWALLOWED: AtomicU32 = AtomicU32::new(0);
+// Heartbeats bumped by the hook callbacks. The poller watches them to decide
+// whether the hooks are actually being called on this machine: a hook that
+// swallows the chord also hides it from GetAsyncKeyState, so exactly one of the
+// two paths may be allowed to own the trigger at a time.
+static KB_BEAT: AtomicU32 = AtomicU32::new(0);
+static MS_BEAT: AtomicU32 = AtomicU32::new(0);
 static STAT_CAPTURE_HITS: AtomicU32 = AtomicU32::new(0);
-static STAT_CAPTURE_ON: AtomicU32 = AtomicU32::new(0);
 
 pub fn stat_keys() -> u32 {
     STAT_KEYS.load(Ordering::Relaxed)
 }
 pub fn stat_capture_active() -> u32 {
-    STAT_CAPTURE_ACTIVE.load(Ordering::Relaxed)
+    CAPTURING.load(Ordering::Relaxed)
 }
 pub fn stat_capture_hits() -> u32 {
     STAT_CAPTURE_HITS.load(Ordering::Relaxed)
 }
-
-unsafe extern "system" fn sink_proc(hwnd: HWND, msg: u32, wparam: WP, lparam: LPARAM) -> LRESULT {
-    if msg == WM_HOTKEY {
-        // RegisterHotKey already swallowed the key; report the press and let the
-        // poller notice the release.
-        if TRIGGER_HELD.swap(1, Ordering::SeqCst) == 0 {
-            if let Some(tx) = EVENT_TX.get() {
-                let _ = tx.send(HotkeyEvent::Down);
-            }
-        }
-        return LRESULT(0);
-    }
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+pub fn stat_hook_rounds() -> u32 {
+    KB_BEAT.load(Ordering::Relaxed)
+}
+pub fn stat_mouse() -> u32 {
+    STAT_MOUSE.load(Ordering::Relaxed)
+}
+pub fn stat_swallowed() -> u32 {
+    STAT_SWALLOWED.load(Ordering::Relaxed)
 }
 
-/// Create (once) the hidden window that receives WM_HOTKEY. Must run on the thread
-/// that pumps messages.
-fn ensure_sink() -> Option<HWND> {
-    let existing = TRIGGER_HWND.load(Ordering::SeqCst);
-    if existing != 0 {
-        return Some(HWND(existing as *mut _));
+// ----- helpers -----
+
+#[inline]
+fn key_down(vk: u32) -> bool {
+    if vk == 0 || vk > 255 {
+        return false;
     }
-    unsafe {
-        let hinst = GetModuleHandleW(None).ok()?;
-        let class = w!("NoKeysHotkeySink");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(sink_proc),
-            hInstance: hinst.into(),
-            lpszClassName: class,
-            ..Default::default()
-        };
-        // A duplicate class registration just fails and is harmless.
-        let _ = RegisterClassW(&wc);
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            class,
-            PCWSTR::null(),
-            Default::default(),
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            Some(HWND_MESSAGE),
-            None,
-            Some(hinst.into()),
-            None,
-        )
-        .ok()?;
-        TRIGGER_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
-        Some(hwnd)
-    }
+    unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
 }
 
-/// (Re)register the global hotkey. Falls back to the keyboard hook when the chord
-/// is already owned by another application.
-pub fn register_trigger(hotkey: &Hotkey) {
-    TRIGGER_ACTIVE.store(0, Ordering::SeqCst);
-    unsafe {
-        let old = TRIGGER_HWND.load(Ordering::SeqCst);
-        if old != 0 {
-            let _ = UnregisterHotKey(Some(HWND(old as *mut _)), 1);
-        }
+fn mods_now() -> u32 {
+    let mut bits = 0;
+    if key_down(VK_CONTROL.0 as u32) {
+        bits |= M_CTRL;
     }
-    if hotkey.mouse != 0 {
-        crate::ntrace!("trigger: mouse hotkey, low-level hook only");
-        return;
+    if key_down(VK_MENU.0 as u32) {
+        bits |= M_ALT;
     }
-    let Some(hwnd) = ensure_sink() else {
-        crate::ntrace!("trigger: no sink window, falling back to hook");
-        return;
-    };
-    let mods = HOT_KEY_MODIFIERS(
-        0 | if hotkey.alt { MOD_ALT.0 } else { 0 }
-            | if hotkey.ctrl { MOD_CONTROL.0 } else { 0 }
-            | if hotkey.shift { MOD_SHIFT.0 } else { 0 }
-            | if hotkey.win { MOD_WIN.0 } else { 0 }
-            | MOD_NOREPEAT.0,
-    );
-    let ok = unsafe { RegisterHotKey(Some(hwnd), 1, mods, hotkey.key) };
-    if ok.is_ok() {
-        TRIGGER_ACTIVE.store(1, Ordering::SeqCst);
-        TRIGGER_VK.store(hotkey.key as u32, Ordering::SeqCst);
-            crate::ntrace!("trigger: RegisterHotKey OK (vk={})", hotkey.key);
-    } else {
-        crate::ntrace!(
-            "trigger: RegisterHotKey FAILED ({:?}), falling back to low-level hook",
-            ok
-        );
+    if key_down(VK_SHIFT.0 as u32) {
+        bits |= M_SHIFT;
+    }
+    if key_down(VK_LWIN.0 as u32) || key_down(VK_RWIN.0 as u32) {
+        bits |= M_WIN;
+    }
+    bits
+}
+
+/// True when every modifier the chord requires is currently held.
+fn mods_satisfied(bits: u32) -> bool {
+    (bits & M_CTRL == 0 || key_down(VK_CONTROL.0 as u32))
+        && (bits & M_ALT == 0 || key_down(VK_MENU.0 as u32))
+        && (bits & M_SHIFT == 0 || key_down(VK_SHIFT.0 as u32))
+        && (bits & M_WIN == 0 || key_down(VK_LWIN.0 as u32) || key_down(VK_RWIN.0 as u32))
+}
+
+fn chord_down() -> bool {
+    let mouse = MOUSE_VK.load(Ordering::Relaxed);
+    let key = KEY_VK.load(Ordering::Relaxed);
+    let target = if mouse != 0 { mouse } else { key };
+    if target == 0 {
+        return false;
+    }
+    key_down(target) && mods_satisfied(MODS.load(Ordering::Relaxed))
+}
+
+fn emit(ev: HotkeyEvent) {
+    if let Some(tx) = EVENT_TX.get() {
+        let _ = tx.send(ev);
     }
 }
 
-/// Single background poller. It does two hook-free jobs:
-///   1. report `Up` once the trigger key is released (RegisterHotKey has no key-up),
-///   2. capture a new hotkey by watching `GetAsyncKeyState` edges, which keeps
-///      rebinding working even when the OS drops our low-level keyboard hook.
-pub fn start_input_poller() {
-    std::thread::spawn(|| {
-        const VK_CONTROL_G: i32 = 0x11;
-        const VK_SHIFT_G: i32 = 0x10;
-        const VK_MENU_G: i32 = 0x12;
-        const VK_LWIN_G: i32 = 0x5B;
-        const VK_RWIN_G: i32 = 0x5C;
-
-        let down = |vk: i32| -> bool { unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 } };
-
-        let mut prev = [false; 256];
-        let mut was_capturing = false;
-
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(8));
-
-            // 1. trigger key release
-            if TRIGGER_ACTIVE.load(Ordering::SeqCst) == 1 && TRIGGER_HELD.load(Ordering::SeqCst) == 1
-            {
-                let vk = TRIGGER_VK.load(Ordering::SeqCst) as i32;
-                if !down(vk) && TRIGGER_HELD.swap(0, Ordering::SeqCst) == 1 {
-                    if let Some(tx) = EVENT_TX.get() {
-                        let _ = tx.send(HotkeyEvent::Up);
-                    }
-                }
-            }
-
-            // 2. rebinding capture
-            let capturing = STAT_CAPTURE_ON.load(Ordering::SeqCst) == 1;
-            if !capturing {
-                if was_capturing {
-                    // Reset the edge detector for the next capture session.
-                    prev = [false; 256];
-                    was_capturing = false;
-                }
-                continue;
-            }
-            if !was_capturing {
-                // Seed with keys already held so a still-pressed chord cannot
-                // immediately become the new hotkey.
-                for vk in 0..256usize {
-                    prev[vk] = down(vk as i32);
-                }
-                was_capturing = true;
-                continue;
-            }
-
-            let ctrl = down(VK_CONTROL_G);
-            let alt = down(VK_MENU_G);
-            let shift = down(VK_SHIFT_G);
-            let win = down(VK_LWIN_G) || down(VK_RWIN_G);
-
-            for vk in 1u32..=254 {
-                let is_down = down(vk as i32);
-                let was = prev[vk as usize];
-                prev[vk as usize] = is_down;
-                if !is_down || was {
-                    continue;
-                }
-                // Fresh press edge.
-                let is_mouse = (1..=6).contains(&vk);
-                let modifier = matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5);
-                if modifier {
-                    continue;
-                }
-                if is_mouse && (vk == 1 || vk == 2) {
-                    continue; // left/right must stay usable for the UI
-                }
-                if let Some(tx) = EVENT_TX.get() {
-                    if vk == 0x1B {
-                        let _ = tx.send(HotkeyEvent::CaptureCancelled);
-                        STAT_CAPTURE_ON.store(0, Ordering::SeqCst);
-                        continue;
-                    }
-                    let hk = if is_mouse {
-                        Hotkey { ctrl, alt, shift, win, key: 0, mouse: vk }
-                    } else {
-                        Hotkey { ctrl, alt, shift, win, key: vk, mouse: 0 }
-                    };
-                    if !chord_acceptable(&hk) {
-                        // Keep waiting: a bare letter would break typing system-wide.
-                        crate::ntrace!("capture rejected bare vk={vk} (needs a modifier)");
-                        continue;
-                    }
-                    let _ = tx.send(HotkeyEvent::Captured(hk));
-                    STAT_CAPTURE_ON.store(0, Ordering::SeqCst);
-                }
-                break;
-            }
-        }
-    });
-}
-
-// Low-level hooks report the *side-specific* virtual key codes (VK_LCONTROL etc.),
-// so both the generic and the left/right variants must be folded into one flag.
-const VK_LSHIFT_C: u16 = 0xA0;
-const VK_RSHIFT_C: u16 = 0xA1;
-const VK_LCONTROL_C: u16 = 0xA2;
-const VK_RCONTROL_C: u16 = 0xA3;
-const VK_LMENU_C: u16 = 0xA4;
-const VK_RMENU_C: u16 = 0xA5;
-
-/// Update tracked modifier state from a keyboard event.
-fn track_modifier(state: &mut HookState, vk: u16, is_down: bool) {
-    match vk {
-        VK_LSHIFT_C | VK_RSHIFT_C => state.shift = is_down,
-        VK_LCONTROL_C | VK_RCONTROL_C => state.ctrl = is_down,
-        VK_LMENU_C | VK_RMENU_C => state.alt = is_down,
-        v if v == VK_SHIFT.0 => state.shift = is_down,
-        v if v == VK_CONTROL.0 => state.ctrl = is_down,
-        v if v == VK_MENU.0 => state.alt = is_down,
-        v if v == VK_LWIN.0 || v == VK_RWIN.0 => state.win = is_down,
-        _ => {}
+/// Report the chord as pressed. Idempotent: repeated calls while held are no-ops.
+fn press() {
+    if HELD.swap(1, Ordering::SeqCst) == 0 {
+        crate::ntrace!("press -> Down");
+        emit(HotkeyEvent::Down);
     }
 }
 
-fn is_modifier(vk: u16) -> bool {
-    matches!(vk, VK_LSHIFT_C | VK_RSHIFT_C | VK_LCONTROL_C | VK_RCONTROL_C | VK_LMENU_C | VK_RMENU_C)
-        || vk == VK_SHIFT.0
-        || vk == VK_CONTROL.0
-        || vk == VK_MENU.0
-        || vk == VK_LWIN.0
-        || vk == VK_RWIN.0
+/// Report the chord as released. Idempotent, and always clears the rebind
+/// suppression so the next real press works again.
+fn release() {
+    SUPPRESS.store(0, Ordering::SeqCst);
+    if HELD.swap(0, Ordering::SeqCst) == 1 {
+        crate::ntrace!("release -> Up");
+        emit(HotkeyEvent::Up);
+    }
 }
 
-/// A bare letter/digit/punctuation key can never be a sane global hotkey: the
-/// system hotkey swallows it everywhere, which would break typing app-wide.
-/// Function keys and above (F1-F24, media, browser keys) are fine on their own.
+fn is_modifier(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
+}
+
+/// True for the mouse buttons we accept as a hotkey. Left and right are
+/// excluded: they must stay usable for ordinary clicking, including on our own
+/// settings dialog.
+fn is_mouse_button(vk: u32) -> bool {
+    matches!(vk, 0x04 | 0x05 | 0x06)
+}
+
+/// Keys that produce no text and can therefore be a hotkey on their own.
+/// A bare letter, digit or punctuation key would have to be swallowed
+/// system-wide, which would break typing in every application, so those always
+/// need Ctrl/Alt/Win. Mouse buttons are handled separately and never need a
+/// modifier either.
 fn bare_key_allowed(vk: u32) -> bool {
-    vk >= 0x70 || vk == 0x2C /* PrintScreen */
+    matches!(vk,
+        // F1-F24
+        0x70..=0x87
+        // PrintScreen, ScrollLock, Pause
+        | 0x2C | 0x91 | 0x13
+        // browser, volume, media and app-launch keys
+        | 0xA6..=0xB7
+    )
 }
 
 fn chord_acceptable(hk: &Hotkey) -> bool {
@@ -336,107 +224,88 @@ fn chord_acceptable(hk: &Hotkey) -> bool {
     hk.ctrl || hk.alt || hk.win || bare_key_allowed(hk.key)
 }
 
-/// Detect any mouse button press, for hotkey rebinding.
-fn mouse_btn_state_any(msg: u32, lparam: LPARAM) -> (Option<u32>, bool) {
-    match msg {
-        WM_LBUTTONDOWN => (Some(VK_LBUTTON.0 as u32), false),
-        WM_RBUTTONDOWN => (Some(VK_RBUTTON.0 as u32), false),
-        WM_MBUTTONDOWN => (Some(VK_MBUTTON.0 as u32), false),
-        WM_XBUTTONDOWN => {
-            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-            let which = (info.mouseData >> 16) & 0xFFFF;
-            let vk = if which == 1 {
-                VK_XBUTTON1.0 as u32
-            } else {
-                VK_XBUTTON2.0 as u32
-            };
-            (Some(vk), false)
-        }
-        _ => (None, false),
+/// Turn a fresh key press into a chord, or None when it must be ignored
+/// (modifier, left/right mouse button, or a bare key that types).
+fn classify(vk: u32, mods: u32) -> Option<Hotkey> {
+    if is_modifier(vk) || vk == 0x01 || vk == 0x02 {
+        return None;
+    }
+    let hk = Hotkey {
+        ctrl: mods & M_CTRL != 0,
+        alt: mods & M_ALT != 0,
+        shift: mods & M_SHIFT != 0,
+        win: mods & M_WIN != 0,
+        key: if is_mouse_button(vk) { 0 } else { vk },
+        mouse: if is_mouse_button(vk) { vk } else { 0 },
+    };
+    if chord_acceptable(&hk) {
+        Some(hk)
+    } else {
+        None
     }
 }
 
-/// Given a mouse-button virtual key and a mouse hook message, return (is_down, is_up).
-fn mouse_btn_state(mouse_vk: u32, msg: u32, lparam: LPARAM) -> (bool, bool) {
-    match mouse_vk as u16 {
-        x if x == VK_LBUTTON.0 => (msg == WM_LBUTTONDOWN, msg == WM_LBUTTONUP),
-        x if x == VK_RBUTTON.0 => (msg == WM_RBUTTONDOWN, msg == WM_RBUTTONUP),
-        x if x == VK_MBUTTON.0 => (msg == WM_MBUTTONDOWN, msg == WM_MBUTTONUP),
-        x if x == VK_XBUTTON1.0 || x == VK_XBUTTON2.0 => {
-            if msg != WM_XBUTTONDOWN && msg != WM_XBUTTONUP {
-                return (false, false);
-            }
-            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-            let which = (info.mouseData >> 16) & 0xFFFF;
-            if which as u16 != x {
-                return (false, false);
-            }
-            (msg == WM_XBUTTONDOWN, msg == WM_XBUTTONUP)
-        }
-        _ => (false, false),
+/// Why a fresh key press cannot become a hotkey, or None when it simply is not
+/// a candidate yet (a modifier on its way to completing a chord).
+fn reject_reason(vk: u32, mods: u32) -> Option<u8> {
+    if is_modifier(vk) {
+        return None;
     }
+    if vk == 0x01 || vk == 0x02 {
+        return Some(2);
+    }
+    if classify(vk, mods).is_none() {
+        return Some(1);
+    }
+    None
 }
+
+// ----- low-level hooks: they swallow, they never report -----
 
 unsafe extern "system" fn kb_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let msg = wparam.0 as u32;
-        let guard = HOOK_STATE.get().expect("hook state");
-        let mut st = guard.lock().unwrap();
-
         let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-
         if is_down || is_up {
-            let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            KB_BEAT.fetch_add(1, Ordering::Relaxed);
+            let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            let vk = info.vkCode as u32;
             if is_down {
                 STAT_KEYS.fetch_add(1, Ordering::Relaxed);
             }
-            track_modifier(&mut st, info.vkCode as u16, is_down);
-            if st.debug {
-                eprintln!(
-                    "[hook] vk={:#04x} down={} mods(ctrl={} alt={} shift={} win={}) engaged={} capturing={}",
-                    info.vkCode, is_down, st.ctrl, st.alt, st.shift, st.win, st.engaged, st.capturing
-                );
-            }
 
-            // Rebinding: swallow everything, report the first non-modifier key press.
-            if st.capturing {
-                STAT_CAPTURE_ACTIVE.fetch_add(1, Ordering::Relaxed);
-                let settled = st.capture_started.elapsed().as_millis() > 350;
-                if is_down && settled && info.vkCode == 0x1B {
-                    // Esc aborts rebinding
-                    st.capturing = false;
-                    let _ = st.tx.send(HotkeyEvent::CaptureCancelled);
-                } else if is_down && settled && !is_modifier(info.vkCode as u16) {
-                    let hk = st.snapshot(info.vkCode, 0);
-                    if !chord_acceptable(&hk) {
-                        return LRESULT(1);
-                    }
-                    STAT_CAPTURE_HITS.fetch_add(1, Ordering::Relaxed);
-                    st.capturing = false;
-                    let _ = st.tx.send(HotkeyEvent::Captured(hk));
-                }
+            // Escape always gives the keyboard back. It is the one key that must
+            // work even when everything else is being swallowed.
+            if SWALLOW.load(Ordering::Relaxed) == 1 && vk == 0x1B {
+                release();
                 return LRESULT(1);
             }
-
-            // Keyboard hotkey handling only applies when the hotkey is a keyboard key.
-            if st.hotkey.mouse == 0 && TRIGGER_ACTIVE.load(Ordering::Relaxed) == 0 {
-                if st.engaged {
-                    // While engaged, swallow the whole keyboard stream so the chord
-                    // (including modifier releases) never reaches the foreground app.
-                    if is_up && info.vkCode == st.hotkey.key {
-                        st.engaged = false;
-                        let _ = st.tx.send(HotkeyEvent::Up);
-                    }
-                    return LRESULT(1);
-                } else if is_down
-                    && info.vkCode == st.hotkey.key
-                    && st.mods_match(&st.hotkey)
-                {
-                    st.engaged = true;
-                    let _ = st.tx.send(HotkeyEvent::Down);
+            // The hook owns the trigger whenever it is running: it also swallows
+            // the chord, which keeps the key out of the async key state, so the
+            // poller could never observe the press. Never while rebinding, or the
+            // capture dialog would open the overlay it is trying to configure.
+            if CAPTURING.load(Ordering::Relaxed) == 0
+                && MOUSE_VK.load(Ordering::Relaxed) == 0
+                && vk == KEY_VK.load(Ordering::Relaxed)
+            {
+                if is_up && HELD.load(Ordering::Relaxed) == 1 {
+                    STAT_SWALLOWED.fetch_add(1, Ordering::Relaxed);
+                    release();
                     return LRESULT(1);
                 }
+                if is_down && HELD.load(Ordering::Relaxed) == 0 && mods_satisfied(MODS.load(Ordering::Relaxed))
+                {
+                    press();
+                    return LRESULT(1);
+                }
+            }
+            // While the overlay is up the whole keyboard stays with us. This is
+            // tied to the overlay being visible, not to any internal flag: the
+            // old sticky state is what used to leave machines with no keyboard.
+            if SWALLOW.load(Ordering::Relaxed) == 1 && HELD.load(Ordering::Relaxed) == 1 {
+                STAT_SWALLOWED.fetch_add(1, Ordering::Relaxed);
+                return LRESULT(1);
             }
         }
     }
@@ -444,95 +313,82 @@ unsafe extern "system" fn kb_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
 }
 
 unsafe extern "system" fn ms_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    STAT_MOUSE.fetch_add(1, Ordering::Relaxed);
+    MS_BEAT.fetch_add(1, Ordering::Relaxed);
     if code >= 0 {
         let msg = wparam.0 as u32;
-        let guard = HOOK_STATE.get().expect("hook state");
-        let mut st = guard.lock().unwrap();
-
-        // Wheel switching while the overlay is engaged.
-        if st.engaged && msg == WM_MOUSEWHEEL {
-            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        if msg == WM_MOUSEWHEEL && HELD.load(Ordering::Relaxed) == 1 && SWALLOW.load(Ordering::Relaxed) == 1 {
+            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
             let delta = ((info.mouseData >> 16) & 0xFFFF) as i16 as i32;
-            let _ = st.tx.send(HotkeyEvent::Wheel(delta));
+            emit(HotkeyEvent::Wheel(delta));
             return LRESULT(1);
         }
-
-        // Rebinding: only consume a middle/side button press as the new hotkey.
-        // Everything else (cursor moves, left/right clicks, wheel) must pass through,
-        // otherwise the cursor freezes and the dialog becomes unusable.
-        if st.capturing {
-            let settled = st.capture_started.elapsed().as_millis() > 350;
-            if settled {
-                if let (Some(vk), _) = mouse_btn_state_any(msg, lparam) {
-                    if vk != VK_LBUTTON.0 as u32 && vk != VK_RBUTTON.0 as u32 {
-                        let hk = st.snapshot(0, vk);
-                        st.capturing = false;
-                        let _ = st.tx.send(HotkeyEvent::Captured(hk));
-                        return LRESULT(1);
-                    }
-                }
-            }
-        }
-
-        // Mouse-button hotkey handling.
-        if st.hotkey.mouse != 0 {
-            let (down, up) = mouse_btn_state(st.hotkey.mouse, msg, lparam);
-            if st.engaged {
-                if up {
-                    st.engaged = false;
-                    let _ = st.tx.send(HotkeyEvent::Up);
+        let chord_mouse = MOUSE_VK.load(Ordering::Relaxed);
+        if chord_mouse != 0 && CAPTURING.load(Ordering::Relaxed) == 0 {
+            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+            let (button, down, up) = mouse_msg(msg, info);
+            if button == chord_mouse && (down || up) {
+                if up && HELD.load(Ordering::Relaxed) == 1 {
+                    release();
                     return LRESULT(1);
                 }
-                if down {
-                    return LRESULT(1); // swallow repeated down while held
+                if down && HELD.load(Ordering::Relaxed) == 0 && mods_satisfied(MODS.load(Ordering::Relaxed))
+                {
+                    press();
+                    return LRESULT(1);
                 }
-            } else if down && st.mods_match(&st.hotkey) {
-                st.engaged = true;
-                let _ = st.tx.send(HotkeyEvent::Down);
-                return LRESULT(1);
             }
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// Install both low-level hooks on the calling thread. The calling thread must run
-/// a Windows message pump afterwards (the Slint event loop does).
-pub fn install(tx: Sender<HotkeyEvent>, hotkey: Hotkey) {
-    let _ = EVENT_TX.set(tx.clone());
-    let hotkey_dbg = format!("{hotkey:?}");
-    let _ = HOOK_STATE.set(Mutex::new(HookState {
-        engaged: false,
-        hotkey,
-        tx,
-        ctrl: false,
-        alt: false,
-        shift: false,
-        win: false,
-        capturing: false,
-        capture_started: std::time::Instant::now(),
-        debug: std::env::var("NOKEYS_DEBUG_HOOK").is_ok(),
-    }));
-
-    install_hooks();
-    register_trigger(&hotkey);
-    start_input_poller();
-    eprintln!("[nokeys] hooks installed: hotkey={hotkey_dbg}");
+/// Decode a low-level mouse message into (virtual key, is_down, is_up).
+fn mouse_msg(msg: u32, info: &MSLLHOOKSTRUCT) -> (u32, bool, bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_XBUTTONDOWN, WM_XBUTTONUP,
+    };
+    match msg {
+        WM_LBUTTONDOWN => (0x01, true, false),
+        WM_LBUTTONUP => (0x01, false, true),
+        WM_RBUTTONDOWN => (0x02, true, false),
+        WM_RBUTTONUP => (0x02, false, true),
+        WM_MBUTTONDOWN => (0x04, true, false),
+        WM_MBUTTONUP => (0x04, false, true),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let which = ((info.mouseData >> 16) & 0xFFFF) as u32;
+            let vk = if which == 1 { 0x05 } else { 0x06 };
+            (vk, msg == WM_XBUTTONDOWN, msg == WM_XBUTTONUP)
+        }
+        _ => (0, false, false),
+    }
 }
 
 fn install_hooks() {
-    // Low-level hooks live in the process itself (not a DLL); pass NULL for hMod.
-    // They must be installed from the thread that pumps messages (the UI thread).
+    // Callbacks live in this process (not in a DLL), so hMod is null; dwThreadId
+    // 0 makes them system-wide. They must be installed from a thread that pumps
+    // messages, i.e. the Slint UI thread.
     let kb = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_proc), None, 0) };
     let ms = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(ms_proc), None, 0) };
+    let kb_err = format!("{:?}", kb.as_ref().err());
+    let ms_err = format!("{:?}", ms.as_ref().err());
     KB_HOOK.store(kb.map(|h| h.0 as isize).unwrap_or(0), Ordering::Relaxed);
     MS_HOOK.store(ms.map(|h| h.0 as isize).unwrap_or(0), Ordering::Relaxed);
+    crate::ntrace!(
+        "install_hooks thread={:?} kb={}(err={}) ms={}(err={})",
+        std::thread::current().id(),
+        KB_HOOK.load(Ordering::Relaxed),
+        kb_err,
+        MS_HOOK.load(Ordering::Relaxed),
+        ms_err
+    );
 }
 
-/// Re-install both hooks. Windows silently removes a low-level hook whose callback
-/// exceeded the timeout, and there is no way to detect that, so we refresh
-/// periodically. Must run on the event-loop (message-pumping) thread.
-pub fn reinstall_hooks() {
+/// Swap a fresh hook in. Windows drops a low-level hook whose callback overran
+/// its timeout without telling anybody, so this runs periodically. Must be
+/// called from the hook pump thread.
+fn reinstall_hooks() {
     unsafe {
         let kb = KB_HOOK.swap(0, Ordering::Relaxed);
         let ms = MS_HOOK.swap(0, Ordering::Relaxed);
@@ -551,113 +407,328 @@ pub fn reinstall_hooks() {
     );
 }
 
-/// Toggle rebinding capture mode. While active every key/mouse event is swallowed
-/// and the first non-modifier key press is reported as [`HotkeyEvent::Captured`].
+/// Low-level hooks are delivered through the installing thread's message queue,
+/// so the hook needs a thread that actually pumps one. This thread does nothing
+/// else: no windows, no callbacks that could block, just GetMessage.
+fn start_hook_thread() {
+    std::thread::spawn(|| unsafe {
+        // Force this thread's message queue into existence before the hook goes
+        // in, then install and start pumping.
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+        HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+        install_hooks();
+        crate::ntrace!(
+            "hook thread pumping tid={} kb={} ms={}",
+            GetCurrentThreadId(),
+            KB_HOOK.load(Ordering::Relaxed),
+            MS_HOOK.load(Ordering::Relaxed)
+        );
+
+        loop {
+            let ret = GetMessageW(&mut msg, None, 0, 0);
+            if ret.0 <= 0 {
+                break;
+            }
+            if msg.message == WM_APP + 1 {
+                reinstall_hooks();
+                continue;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        crate::ntrace!("hook thread stopped");
+    });
+}
+
+// ----- polling thread -----
+
+fn apply_chord(hotkey: &Hotkey) {
+    let mut bits = 0;
+    if hotkey.ctrl {
+        bits |= M_CTRL;
+    }
+    if hotkey.alt {
+        bits |= M_ALT;
+    }
+    if hotkey.shift {
+        bits |= M_SHIFT;
+    }
+    if hotkey.win {
+        bits |= M_WIN;
+    }
+    MODS.store(bits, Ordering::SeqCst);
+    KEY_VK.store(if hotkey.mouse != 0 { 0 } else { hotkey.key }, Ordering::SeqCst);
+    MOUSE_VK.store(hotkey.mouse, Ordering::SeqCst);
+    HELD.store(0, Ordering::SeqCst);
+    SUPPRESS.store(0, Ordering::SeqCst);
+}
+
+/// Single background thread that owns both the trigger edges and the rebinding
+/// edge detector. Polling is deliberate: GetAsyncKeyState keeps working when
+/// Windows has silently dropped a low-level hook, which is the case that used
+/// to make a resident hotkey look dead with no way to tell.
+fn start_poller() {
+    std::thread::spawn(|| {
+        const ESC: u32 = 0x1B;
+        const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+
+        let mut prev = [false; 256];
+        let mut seeded = false;
+        let mut ticks: u32 = 0;
+        // Hook liveness: the callbacks bump a heartbeat; one that stays still for
+        // ALIVE_TICKS is not being called and the poller has to take over.
+        const ALIVE_TICKS: u32 = 375;
+        let mut kb_beat = KB_BEAT.load(Ordering::Relaxed);
+        let mut ms_beat = MS_BEAT.load(Ordering::Relaxed);
+        let mut kb_idle: u32 = ALIVE_TICKS;
+        let mut ms_idle: u32 = ALIVE_TICKS;
+        let mut poller_pressed = false;
+        let mut engaged_ticks: u32 = 0;
+        let mut seq = 0u64;
+        let mut capture_started = Instant::now();
+
+        loop {
+            std::thread::sleep(Duration::from_millis(8));
+
+            if CAPTURING.load(Ordering::SeqCst) == 1 {
+                let now_seq = CAPTURE_SEQ.load(Ordering::SeqCst);
+                if !seeded || now_seq != seq {
+                    // Seed with whatever is already held: the click that started
+                    // the capture must not become the new hotkey.
+                    for vk in 0..256usize {
+                        prev[vk] = key_down(vk as u32);
+                    }
+                    seeded = true;
+                    seq = now_seq;
+                    capture_started = Instant::now();
+                    continue;
+                }
+                if capture_started.elapsed() > CAPTURE_TIMEOUT {
+                    CAPTURING.store(0, Ordering::SeqCst);
+                    emit(HotkeyEvent::CaptureCancelled);
+                    continue;
+                }
+                let mods = mods_now();
+                let mut hit: Option<Result<Hotkey, ()>> = None;
+                for vk in 1u32..=254 {
+                    let is_down = key_down(vk);
+                    let was = prev[vk as usize];
+                    prev[vk as usize] = is_down;
+                    if !is_down || was || hit.is_some() {
+                        continue;
+                    }
+                    if vk == ESC {
+                        hit = Some(Err(()));
+                        continue;
+                    }
+                    if let Some(hk) = classify(vk, mods) {
+                        hit = Some(Ok(hk));
+                        continue;
+                    }
+                    // Not usable: say so and keep waiting, so a mistyped chord is
+                    // not silently ignored.
+                    if let Some(code) = reject_reason(vk, mods) {
+                        crate::ntrace!("capture rejected vk={vk} mods={mods} code={code}");
+                        emit(HotkeyEvent::CaptureRejected(code));
+                    }
+                }
+                if let Some(result) = hit {
+                    CAPTURING.store(0, Ordering::SeqCst);
+                    match result {
+                        Ok(hk) => {
+                            STAT_CAPTURE_HITS.fetch_add(1, Ordering::Relaxed);
+                            emit(HotkeyEvent::Captured(hk));
+                        }
+                        Err(()) => emit(HotkeyEvent::CaptureCancelled),
+                    }
+                }
+                continue;
+            }
+            seeded = false;
+            ticks = ticks.wrapping_add(1);
+
+            let nkb = KB_BEAT.load(Ordering::Relaxed);
+            if nkb != kb_beat {
+                kb_beat = nkb;
+                kb_idle = 0;
+            } else {
+                kb_idle = kb_idle.saturating_add(1);
+            }
+            let nms = MS_BEAT.load(Ordering::Relaxed);
+            if nms != ms_beat {
+                ms_beat = nms;
+                ms_idle = 0;
+            } else {
+                ms_idle = ms_idle.saturating_add(1);
+            }
+
+            let mouse_chord = MOUSE_VK.load(Ordering::Relaxed) != 0;
+            let hook_alive = if mouse_chord {
+                ms_idle < ALIVE_TICKS
+            } else {
+                kb_idle < ALIVE_TICKS
+            };
+
+            // Last-resort guard: a hotkey-triggered overlay that somehow never
+            // sees its release must not keep the keyboard. 30s is far longer than
+            // any real hold, and the overlay is visible the whole time.
+            if SWALLOW.load(Ordering::Relaxed) == 1 && HELD.load(Ordering::Relaxed) == 1 {
+                engaged_ticks = engaged_ticks.saturating_add(1);
+                if engaged_ticks > 3750 {
+                    crate::ntrace!("engaged too long, forcing release");
+                    engaged_ticks = 0;
+                    release();
+                }
+            } else {
+                engaged_ticks = 0;
+            }
+
+            if hook_alive {
+                // The hook is swallowing the chord, so its key never reaches the
+                // async key state and polling cannot see it. Stand down. Only
+                // give back a chord the poller itself opened: a chord the hook
+                // opened is the hook's to release, and it will see the key up.
+                if poller_pressed {
+                    poller_pressed = false;
+                    release();
+                }
+                continue;
+            }
+
+            if ticks % 500 == 0 {
+                crate::ntrace!(
+                    "poller owns trigger key={} mouse={} mods={} down={} held={}",
+                    KEY_VK.load(Ordering::Relaxed),
+                    MOUSE_VK.load(Ordering::Relaxed),
+                    MODS.load(Ordering::Relaxed),
+                    chord_down(),
+                    HELD.load(Ordering::Relaxed)
+                );
+            }
+            if chord_down() {
+                // Suppression only guards this path: right after a rebind the
+                // chord's own keys are still held, and polling would otherwise
+                // read that as a fresh press. A real new key press always goes
+                // through the hook, which is never suppressed.
+                if SUPPRESS.load(Ordering::Relaxed) == 0 {
+                    if HELD.load(Ordering::Relaxed) == 0 {
+                        poller_pressed = true;
+                    }
+                    press();
+                }
+            } else {
+                // The physical state is authoritative while the poller owns the
+                // trigger, so any engaged chord is finished here - including one
+                // the hook opened and then lost sight of. This also clears a
+                // rebind suppression.
+                poller_pressed = false;
+                release();
+            }
+        }
+    });
+}
+
+// ----- public API -----
+
+/// Install the hooks and start the poller. Must be called from the thread that
+/// runs the Slint event loop.
+pub fn install(tx: Sender<HotkeyEvent>, hotkey: Hotkey) {
+    let _ = EVENT_TX.set(tx);
+    apply_chord(&hotkey);
+    start_hook_thread();
+    start_poller();
+    crate::ntrace!("installed: chord={hotkey:?}");
+}
+
+/// Toggle rebinding capture mode. Capture itself never swallows input: the
+/// physical key state is what gets recorded, so the user keeps typing into
+/// whatever window is focused (which, when they just clicked "改绑", is ours).
 pub fn set_capturing(on: bool) {
-    crate::ntrace!("hotkey::set_capturing({on}) state={}", HOOK_STATE.get().is_some());
-    STAT_CAPTURE_ON.store(if on { 1 } else { 0 }, Ordering::SeqCst);
-    if let Some(state) = HOOK_STATE.get() {
-        if let Ok(mut st) = state.lock() {
-            st.capturing = on;
-            st.capture_started = std::time::Instant::now();
-            crate::ntrace!("  hook capturing={}", st.capturing);
+    CAPTURING.store(if on { 1 } else { 0 }, Ordering::SeqCst);
+    CAPTURE_SEQ.fetch_add(1, Ordering::SeqCst);
+    // Cancelling a rebind must leave the next press working; only a completed
+    // rebind (set_hotkey) needs the suppression, because only then are the
+    // chord's own keys still held.
+    SUPPRESS.store(0, Ordering::SeqCst);
+    crate::ntrace!("set_capturing({on})");
+}
+
+/// Ask the hook thread to swap its hooks for fresh ones. Windows drops a hook
+/// whose callback overran its timeout without telling anybody.
+pub fn request_hook_refresh() {
+    let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+    if tid != 0 {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                tid,
+                WM_APP + 1,
+                WPARAM(0),
+                LPARAM(0),
+            );
         }
     }
 }
 
-/// Replace the active hotkey (e.g. after a rebind).
+/// Replace the active chord after a rebind.
 pub fn set_hotkey(hotkey: Hotkey) {
-    TRIGGER_HELD.store(0, Ordering::SeqCst);
-    register_trigger(&hotkey);
-    if let Some(state) = HOOK_STATE.get() {
-        if let Ok(mut st) = state.lock() {
-            st.hotkey = hotkey;
-            st.engaged = false;
-            st.ctrl = false;
-            st.alt = false;
-            st.shift = false;
-            st.win = false;
-        }
-    }
+    apply_chord(&hotkey);
+    SUPPRESS.store(1, Ordering::SeqCst);
+    crate::ntrace!("set_hotkey({hotkey:?})");
 }
 
-/// Offline self-test: feed synthetic keyboard events through the real hook
-/// callbacks to validate hotkey matching without needing OS-level input.
-/// Returns a list of (step, matched) pairs.
-#[cfg(debug_assertions)]
-pub fn selftest(hotkey: Hotkey) -> Vec<(String, bool)> {
-    use std::sync::mpsc::channel;
-    use windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT;
+/// Tell the hotkey layer whether the overlay is currently on screen because of
+/// the hotkey. Only then is the keyboard taken away from the foreground
+/// application, and the flag lives exactly as long as the overlay does.
+pub fn set_overlay_engaged(on: bool) {
+    SWALLOW.store(if on { 1 } else { 0 }, Ordering::SeqCst);
+    if !on {
+        SUPPRESS.store(0, Ordering::SeqCst);
+    }
+    crate::ntrace!("overlay engaged={on}");
+}
 
-    let (tx, rx) = channel();
-    let _ = HOOK_STATE.set(Mutex::new(HookState {
-        engaged: false,
-        hotkey,
-        tx,
-        ctrl: false,
-        alt: false,
+/// Offline self-test of the pure chord logic. No OS input involved.
+#[cfg(debug_assertions)]
+pub fn selftest() -> Vec<(String, bool)> {
+    let ctrl_alt_n = Hotkey {
+        ctrl: true,
+        alt: true,
         shift: false,
         win: false,
-        capturing: false,
-        capture_started: std::time::Instant::now(),
-        debug: false,
-    }));
-
-    // vk codes as the OS would report them (side-specific modifiers)
-    let (ctrl_vk, alt_vk) = (0xA2u32, 0xA4u32);
-    let mut out = Vec::new();
-
-    let mut send = |vk: u32, down: bool| -> Vec<HotkeyEvent> {
-        let info = KBDLLHOOKSTRUCT {
-            vkCode: vk,
-            ..Default::default()
-        };
-        let msg = if down { WM_KEYDOWN } else { WM_KEYUP };
-        unsafe {
-            kb_proc(0, WPARAM(msg as usize), LPARAM(&info as *const _ as isize));
-        }
-        rx.try_iter().collect()
+        key: 0x4E,
+        mouse: 0,
     };
-
-    if hotkey.ctrl {
-        send(ctrl_vk, true);
-    }
-    if hotkey.alt {
-        send(alt_vk, true);
-    }
-    let evs = send(hotkey.key, true);
-    out.push((
-        "chord down emits Down".into(),
-        evs.iter().any(|e| matches!(e, HotkeyEvent::Down)),
-    ));
-
-    // a second keydown while engaged must not emit another Down
-    let evs = send(hotkey.key, true);
-    out.push((
-        "repeat while held emits nothing".into(),
-        !evs.iter().any(|e| matches!(e, HotkeyEvent::Down)),
-    ));
-
-    let evs = send(hotkey.key, false);
-    out.push((
-        "key up emits Up".into(),
-        evs.iter().any(|e| matches!(e, HotkeyEvent::Up)),
-    ));
-
-    if hotkey.alt {
-        send(alt_vk, false);
-    }
-    if hotkey.ctrl {
-        send(ctrl_vk, false);
-    }
-
-    // pressing the key alone (no modifiers) must not trigger
-    let evs = send(hotkey.key, true);
-    out.push((
-        "bare key does not trigger".into(),
-        !evs.iter().any(|e| matches!(e, HotkeyEvent::Down)),
-    ));
-    send(hotkey.key, false);
-
-    out
+    vec![
+        ("bare letter is rejected".into(), classify(0x4E, 0).is_none()),
+        (
+            "ctrl+alt+letter is accepted".into(),
+            classify(0x4E, M_CTRL | M_ALT) == Some(ctrl_alt_n),
+        ),
+        (
+            "modifier keys are never a chord".into(),
+            classify(0x11, M_CTRL).is_none() && classify(0x5B, 0).is_none(),
+        ),
+        ("bare function key is accepted".into(), classify(0x70, 0).is_some()),
+        (
+            "left/right mouse stay free".into(),
+            classify(0x01, M_CTRL).is_none() && classify(0x02, M_CTRL).is_none(),
+        ),
+        (
+            "side mouse button is a chord".into(),
+            classify(0x05, M_CTRL).map(|h| h.mouse == 0x05 && h.key == 0) == Some(true),
+        ),
+        (
+            "shift alone does not qualify a letter".into(),
+            classify(0x4E, M_SHIFT).is_none(),
+        ),
+        ("wheel delta decode".into(), {
+            let info = MSLLHOOKSTRUCT {
+                mouseData: 120u32 << 16,
+                ..Default::default()
+            };
+            let delta = ((info.mouseData >> 16) & 0xFFFF) as i16 as i32;
+            delta == 120
+        }),
+    ]
 }

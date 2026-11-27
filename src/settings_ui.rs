@@ -1,15 +1,15 @@
 // Settings dialog wiring: keeps the Slint properties in sync with the config.
 
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
-use crate::config::{self, Config, Theme};
+use crate::config::{self, Config};
 use crate::ntrace;
 use crate::hotkey;
 use crate::{
-    apply_animation, apply_theme, is_dark, load_icon, hotkey_label, AppState, EditItem,
+    apply_animation, apply_theme, load_icon, hotkey_label, AppState, EditItem,
     OverlayWindow, SettingsWindow,
 };
 
@@ -23,28 +23,18 @@ pub fn sync_settings(settings: &SettingsWindow, state: &Arc<Mutex<AppState>>) {
     settings.set_hotkey_label(hotkey_label(&cfg.hotkey).into());
     settings.set_wheel_count(cfg.wheels.len() as i32);
     settings.set_route_index(cfg.route_index() as i32);
-    settings.set_theme_index(match cfg.theme {
-        Theme::Auto => 0,
-        Theme::Light => 1,
-        Theme::Dark => 2,
-    });
     settings.set_blur_enabled(cfg.blur.enabled);
     settings.set_blur_strength(cfg.blur.strength);
-    settings.set_blur_color(cfg.blur.color.as_str().into());
-    settings.set_blur_color_c(parse_color_alpha(&cfg.blur.color, 1.0));
 
     settings.set_selected_wheel(st.selected_wheel as i32);
     settings.set_edit_items(ModelRc::new(VecModel::from(build_edit_items(cfg))));
 
     settings.set_list_bg_enabled(cfg.list_background.enabled);
-    settings.set_list_bg_color(cfg.list_background.color.as_str().into());
-    settings.set_list_bg_color_c(parse_color_alpha(&cfg.list_background.color, 1.0));
     settings.set_list_bg_image(cfg.list_background.image.as_str().into());
     settings.set_list_bg_image_set(!cfg.list_background.image.is_empty());
     settings.set_list_bg_opacity(cfg.list_background.opacity);
-    settings.set_card_color(cfg.card_color.as_str().into());
-    settings.set_card_color_c(parse_color_alpha(&cfg.card_color, cfg.card_opacity));
     settings.set_card_opacity(cfg.card_opacity);
+    settings.set_list_columns(cfg.list_columns.clamp(2, 8) as i32);
 
     let a = &cfg.animation;
     settings.set_anim_global(a.global_speed);
@@ -72,6 +62,10 @@ fn build_edit_items(cfg: &Config) -> Vec<EditItem> {
                 has_icon,
                 is_list_entry: item.is_list_entry,
                 nokeys_id: item.id as i32,
+                action_kind: item.action.kind_index() as i32,
+                action_param: item.action.param().into(),
+                action_args: item.action.args().into(),
+                vk_name: item.vk.map(config::vk_name).unwrap_or_default().into(),
             });
         }
     }
@@ -82,17 +76,27 @@ fn build_edit_items(cfg: &Config) -> Vec<EditItem> {
 pub fn refresh_overlay_style(overlay: &OverlayWindow, state: &Arc<Mutex<AppState>>) {
     let st = state.lock().unwrap();
     let cfg = &st.config;
-    apply_theme(overlay, is_dark(cfg));
+    apply_theme(overlay);
     apply_animation(overlay, cfg);
-    overlay.set_card_bg(parse_color_alpha(&cfg.card_color, cfg.card_opacity));
+    // The configured glass colour now really tints the frosted snapshot; it used
+    // to be a dead setting. Kept faint so the disc still reads as glass.
+    overlay.set_blur_tint(parse_color_alpha(GLASS_COLOR, 0.18));
+    overlay.set_blur_tint_2(parse_color_alpha(GLASS_COLOR, 0.34));
+    overlay.set_card_bg(parse_color_alpha(CARD_COLOR, cfg.card_opacity));
+    overlay.set_wheel_total(cfg.wheels.len() as i32);
     overlay.set_list_bg_enabled(cfg.list_background.enabled);
-    overlay.set_list_bg_color(parse_color_alpha(&cfg.list_background.color, 1.0));
+    overlay.set_list_bg_color(parse_color_alpha(LIST_BG_COLOR, 1.0));
     overlay.set_list_bg_opacity(cfg.list_background.opacity);
     overlay.set_list_bg_image_set(!cfg.list_background.image.is_empty());
     if !cfg.list_background.image.is_empty() {
         overlay.set_list_bg_image(load_icon(&cfg.list_background.image));
     }
 }
+
+/// Fixed colours: the overlay look is no longer configurable.
+const CARD_COLOR: &str = "#22242e";
+const LIST_BG_COLOR: &str = "#1e1e2e";
+const GLASS_COLOR: &str = "#1f2430";
 
 fn parse_color_alpha(hex: &str, alpha: f32) -> slint::Color {
     let h = hex.trim_start_matches('#');
@@ -110,19 +114,6 @@ fn commit(settings: &SettingsWindow, overlay: &OverlayWindow, state: &Arc<Mutex<
     config::save(&state.lock().unwrap().config).ok();
     sync_settings(settings, state);
     refresh_overlay_style(overlay, state);
-}
-
-/// Some Slint builds deliver a single physical click to `clicked` twice; a short
-/// shared gate keeps every button action idempotent without hurting rapid clicking.
-fn click_allowed() -> bool {
-    static LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
-    let last = LAST.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(1)));
-    let mut last = last.lock().unwrap();
-    if last.elapsed() < Duration::from_millis(180) {
-        return false;
-    }
-    *last = Instant::now();
-    true
 }
 
 /// Copy a user-picked icon next to the config, returning its new path.
@@ -147,6 +138,25 @@ pub fn wire_settings(
     overlay: &OverlayWindow,
     state: &Arc<Mutex<AppState>>,
 ) {
+    // ---------- page transition ----------
+    {
+        let sw = settings.as_weak();
+        settings.on_page_changed(move |_page: i32| {
+            // Fade the content back in: drop it to transparent now, raise it on
+            // the next frame. A page that is built while already opaque never
+            // animates, which is why switching pages used to feel like a hard cut.
+            if let Some(se) = sw.upgrade() {
+                se.set_content_alpha(0.0);
+            }
+            let later = sw.clone();
+            slint::Timer::single_shot(Duration::from_millis(16), move || {
+                if let Some(se) = later.upgrade() {
+                    se.set_content_alpha(1.0);
+                }
+            });
+        });
+    }
+
     // ---------- general ----------
     {
         let st = state.clone();
@@ -154,9 +164,6 @@ pub fn wire_settings(
         // Always *start* capturing (never toggle): a duplicated click event must not
         // cancel the capture it just started.
         settings.on_request_capture(move || {
-            if !click_allowed() {
-                return;
-            }
             st.lock().unwrap().capturing = true;
             hotkey::set_capturing(true);
             ntrace!("request_capture -> capturing=true");
@@ -170,9 +177,6 @@ pub fn wire_settings(
         let st = state.clone();
         let sw = settings.as_weak();
         settings.on_cancel_capture(move || {
-            if !click_allowed() {
-                return;
-            }
             st.lock().unwrap().capturing = false;
             hotkey::set_capturing(false);
             ntrace!("cancel_capture");
@@ -189,24 +193,6 @@ pub fn wire_settings(
         settings.on_set_route(move |idx: i32| {
             if let Some(se) = sw.upgrade() {
                 st.lock().unwrap().config.set_route_index(idx.max(0) as usize);
-                if let Some(ov) = ow.upgrade() {
-                    commit(&se, &ov, &st);
-                }
-            }
-        });
-    }
-
-    {
-        let st = state.clone();
-        let sw = settings.as_weak();
-        let ow = overlay.as_weak();
-        settings.on_set_theme(move |idx: i32| {
-            if let Some(se) = sw.upgrade() {
-                st.lock().unwrap().config.theme = match idx {
-                    1 => Theme::Light,
-                    2 => Theme::Dark,
-                    _ => Theme::Auto,
-                };
                 if let Some(ov) = ow.upgrade() {
                     commit(&se, &ov, &st);
                 }
@@ -242,20 +228,6 @@ pub fn wire_settings(
         });
     }
 
-    {
-        let st = state.clone();
-        let sw = settings.as_weak();
-        let ow = overlay.as_weak();
-        settings.on_set_blur_color(move |v: SharedString| {
-            if let Some(se) = sw.upgrade() {
-                st.lock().unwrap().config.blur.color = v.to_string();
-                if let Some(ov) = ow.upgrade() {
-                    commit(&se, &ov, &st);
-                }
-            }
-        });
-    }
-
     // ---------- wheels ----------
     {
         let st = state.clone();
@@ -273,9 +245,6 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_add_wheel(move || {
-            if !click_allowed() {
-                return;
-            }
             if let Some(se) = sw.upgrade() {
                 {
                     let mut s = st.lock().unwrap();
@@ -296,9 +265,6 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_remove_wheel(move |idx: i32| {
-            if !click_allowed() {
-                return;
-            }
             if let Some(se) = sw.upgrade() {
                 {
                     let mut s = st.lock().unwrap();
@@ -329,21 +295,24 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_add_item(move |wheel: i32| {
-            if !click_allowed() {
-                return;
-            }
             if let Some(se) = sw.upgrade() {
                 {
                     let mut s = st.lock().unwrap();
                     let wi = wheel.max(0) as usize;
                     if wi < s.config.wheels.len() && s.config.wheels[wi].items.len() < 8 {
-                        let id = s.config.alloc_id();
+                        let id = s.config.free_id();
                         s.config.wheels[wi].items.push(config::Item {
                             id,
                             name: format!("功能 {id}"),
                             icon: String::new(),
                             is_list_entry: false,
+                            vk: None,
+                            action: config::Action::default(),
                         });
+                        // New items default to the reserved-key action, which
+                        // needs a key from the pool right away.
+                        let si = s.config.wheels[wi].items.len() - 1;
+                        s.config.sync_vk(wi, si);
                     }
                 }
                 if let Some(ov) = ow.upgrade() {
@@ -395,14 +364,116 @@ pub fn wire_settings(
         });
     }
 
+    // ---------- item actions ----------
+    {
+        let st = state.clone();
+        let sw = settings.as_weak();
+        let ow = overlay.as_weak();
+        settings.on_set_item_action_kind(move |wheel: i32, slot: i32, kind: i32| {
+            if let Some(se) = sw.upgrade() {
+                {
+                    let mut s = st.lock().unwrap();
+                    let (wi, si) = (wheel.max(0) as usize, slot.max(0) as usize);
+                    if let Some(it) = s
+                        .config
+                        .wheels
+                        .get_mut(wi)
+                        .and_then(|w| w.items.get_mut(si))
+                    {
+                        it.action = config::Action::with_kind(kind.max(0) as u32, &it.action);
+                    }
+                    s.config.sync_vk(wi, si);
+                }
+                if let Some(ov) = ow.upgrade() {
+                    commit(&se, &ov, &st);
+                }
+            }
+        });
+    }
+
+    {
+        let st = state.clone();
+        settings.on_set_item_action_param(move |wheel: i32, slot: i32, text: SharedString| {
+            let mut s = st.lock().unwrap();
+            let (wi, si) = (wheel.max(0) as usize, slot.max(0) as usize);
+            if let Some(it) = s
+                .config
+                .wheels
+                .get_mut(wi)
+                .and_then(|w| w.items.get_mut(si))
+            {
+                it.action.set_param(text.to_string());
+            }
+            s.config.sync_vk(wi, si);
+            config::save(&s.config).ok();
+        });
+    }
+
+    {
+        let st = state.clone();
+        settings.on_set_item_action_args(move |wheel: i32, slot: i32, text: SharedString| {
+            let mut s = st.lock().unwrap();
+            let (wi, si) = (wheel.max(0) as usize, slot.max(0) as usize);
+            if let Some(it) = s
+                .config
+                .wheels
+                .get_mut(wi)
+                .and_then(|w| w.items.get_mut(si))
+            {
+                it.action.set_args(text.to_string());
+            }
+            config::save(&s.config).ok();
+        });
+    }
+
+    {
+        let st = state.clone();
+        let sw = settings.as_weak();
+        let ow = overlay.as_weak();
+        settings.on_pick_item_program(move |wheel: i32, slot: i32| {
+            let picked = rfd::FileDialog::new()
+                .add_filter("程序", &["exe", "bat", "cmd", "lnk", "com"])
+                .pick_file();
+            let Some(path) = picked else { return };
+            let Some(se) = sw.upgrade() else { return };
+            {
+                let mut s = st.lock().unwrap();
+                let (wi, si) = (wheel.max(0) as usize, slot.max(0) as usize);
+                if let Some(it) = s
+                    .config
+                    .wheels
+                    .get_mut(wi)
+                    .and_then(|w| w.items.get_mut(si))
+                {
+                    it.action = config::Action::with_kind(1, &it.action);
+                    it.action.set_param(path.display().to_string());
+                }
+            }
+            if let Some(ov) = ow.upgrade() {
+                commit(&se, &ov, &st);
+            }
+        });
+    }
+
+    {
+        let st = state.clone();
+        let sw = settings.as_weak();
+        let ow = overlay.as_weak();
+        settings.on_set_list_columns(move |cols: i32| {
+            if let Some(se) = sw.upgrade() {
+                st.lock().unwrap().config.list_columns = cols.clamp(2, 8) as u32;
+                if let Some(ov) = ow.upgrade() {
+                    commit(&se, &ov, &st);
+                }
+            }
+        });
+    }
+
     {
         let st = state.clone();
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_clear_item(move |wheel: i32, slot: i32| {
-            if !click_allowed() {
-                return;
-            }
             if let Some(se) = sw.upgrade() {
                 {
                     let mut s = st.lock().unwrap();
@@ -428,20 +499,6 @@ pub fn wire_settings(
         settings.on_set_list_bg_enabled(move |v: bool| {
             if let Some(se) = sw.upgrade() {
                 st.lock().unwrap().config.list_background.enabled = v;
-                if let Some(ov) = ow.upgrade() {
-                    commit(&se, &ov, &st);
-                }
-            }
-        });
-    }
-
-    {
-        let st = state.clone();
-        let sw = settings.as_weak();
-        let ow = overlay.as_weak();
-        settings.on_set_list_bg_color(move |v: SharedString| {
-            if let Some(se) = sw.upgrade() {
-                st.lock().unwrap().config.list_background.color = v.to_string();
                 if let Some(ov) = ow.upgrade() {
                     commit(&se, &ov, &st);
                 }
@@ -502,20 +559,6 @@ pub fn wire_settings(
         let st = state.clone();
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
-        settings.on_set_card_color(move |v: SharedString| {
-            if let Some(se) = sw.upgrade() {
-                st.lock().unwrap().config.card_color = v.to_string();
-                if let Some(ov) = ow.upgrade() {
-                    commit(&se, &ov, &st);
-                }
-            }
-        });
-    }
-
-    {
-        let st = state.clone();
-        let sw = settings.as_weak();
-        let ow = overlay.as_weak();
         settings.on_set_card_opacity(move |v: f32| {
             if let Some(se) = sw.upgrade() {
                 st.lock().unwrap().config.card_opacity = v.clamp(0.0, 1.0);
@@ -564,9 +607,6 @@ pub fn wire_settings(
         let sw = settings.as_weak();
         let ow = overlay.as_weak();
         settings.on_clear_all(move || {
-            if !click_allowed() {
-                return;
-            }
             let dir = config::config_dir();
             let _ = std::fs::remove_dir_all(&dir);
             {

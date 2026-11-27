@@ -1,19 +1,36 @@
-// Reusable lightweight widgets for the settings toolbox.
-// Written by hand instead of std-widgets to keep the binary and memory small
-// and to keep the look consistent.
+// Reusable widgets for the settings window.
+//
+// Hand-written instead of std-widgets so the settings UI can share the overlay's
+// palette, radii and motion rules. The app runs on the winit software renderer,
+// which has no element transforms: every "zoomed" state below is expressed by
+// animating x / y / width / height / colours instead.
 
 export global Palette {
-    out property <color> bg: #16171d;
-    out property <color> panel: #1c1e26;
-    out property <color> card: #20222b;
-    out property <color> field: #0f1015;
-    out property <color> line: #ffffff14;
-    out property <color> text: #ffffff;
-    out property <color> dim: #8d93a1;
-    out property <color> accent: #3d7bfd;
-    out property <color> accent-hover: #5589ff;
-    out property <color> danger: #cf3b41;
+    out property <color> bg: #0e1014;
+    out property <color> panel: #14161c;
+    out property <color> card: #191c24;
+    out property <color> card-hover: #1f2430;
+    out property <color> field: #0b0d11;
+    out property <color> line: #ffffff12;
+    out property <color> line-strong: #ffffff1f;
+    out property <color> text: #f2f4f8;
+    out property <color> dim: #8b93a3;
+    out property <color> dim2: #6b7383;
+    out property <color> accent: #5b8cff;
+    out property <color> accent-hover: #7aa2ff;
+    out property <color> accent-soft: #5b8cff24;
+    out property <color> danger: #e5484d;
+    out property <color> danger-hover: #f26166;
+
+    out property <length> radius-card: 14px;
+    out property <length> radius-ctl: 9px;
+    out property <length> pad-page: 24px;
+    out property <length> row-h: 44px;
+    out property <length> gap-group: 18px;
+    out property <length> gap-ctl: 10px;
 }
+
+// ---------------- text ----------------
 
 export component SLabel inherits Text {
     color: Palette.text;
@@ -30,7 +47,7 @@ export component SDimLabel inherits Text {
 
 export component STitle inherits Text {
     color: Palette.text;
-    font-size: 17px;
+    font-size: 18px;
     font-weight: 700;
     vertical-alignment: center;
 }
@@ -42,31 +59,59 @@ export component SSubTitle inherits Text {
     vertical-alignment: center;
 }
 
+/// Card heading: 13px semibold.
+export component SSection inherits Text {
+    color: Palette.text;
+    font-size: 13px;
+    font-weight: 600;
+    vertical-alignment: center;
+}
+
+// ---------------- buttons ----------------
+
 export component SButton inherits Rectangle {
     in property <string> text: "";
     in property <bool> primary: false;
     in property <bool> danger: false;
     in property <bool> enabled: true;
+    out property <bool> hovered: ta.has-hover;
     callback clicked();
 
-    height: 30px;
-    min-width: 76px;
-    border-radius: 7px;
-    background: !root.enabled ? #ffffff10
-        : root.primary ? (ta.has-hover ? Palette.accent-hover : Palette.accent)
-        : root.danger ? (ta.has-hover ? #e5545a : Palette.danger)
-        : (ta.has-hover ? #343849 : #2a2d3a);
+    height: 32px;
+    min-width: 72px;
+    border-radius: Palette.radius-ctl;
+    border-width: 1px;
+    border-color: !root.enabled ? #ffffff0a :
+        root.primary ? transparent :
+        root.danger ? (root.hovered ? #e5484d80 : #e5484d40) :
+        (root.hovered ? Palette.line-strong : Palette.line);
+    background: !root.enabled ? #ffffff08 :
+        root.primary ? (ta.pressed ? #4c79e8 : (root.hovered ? Palette.accent-hover : Palette.accent)) :
+        root.danger ? (ta.pressed ? #e5484d26 : (root.hovered ? #e5484d38 : #e5484d1f)) :
+        (ta.pressed ? #ffffff0c : (root.hovered ? #ffffff17 : #ffffff0d));
+    drop-shadow-color: root.primary && root.enabled ? (root.hovered ? #5b8cff70 : #5b8cff33) : #00000000;
+    drop-shadow-blur: root.hovered ? 18px : 10px;
+    drop-shadow-offset-y: 3px;
+
+    animate background, border-color, drop-shadow-color, drop-shadow-blur { duration: 120ms; easing: ease-out; }
 
     Text {
+        x: 10px;
+        y: 0px;
+        width: parent.width - 20px;
+        height: parent.height;
         text: root.text;
-        color: root.enabled ? Palette.text : #ffffff55;
+        color: !root.enabled ? Palette.dim2 : root.primary ? #ffffff : root.danger ? Palette.danger-hover : Palette.text;
         horizontal-alignment: center;
         vertical-alignment: center;
         font-size: 13px;
+        font-weight: root.primary ? 600 : 500;
+        overflow: elide;
+        animate color { duration: 120ms; easing: ease-out; }
     }
 
     ta := TouchArea {
-        mouse-cursor: pointer;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => {
             if (root.enabled) {
                 root.clicked();
@@ -75,27 +120,36 @@ export component SButton inherits Rectangle {
     }
 }
 
+// ---------------- toggle ----------------
+
 export component SToggle inherits Rectangle {
     in-out property <bool> checked: false;
+    out property <bool> hovered: ta.has-hover;
     callback toggled(bool);
 
-    width: 42px;
-    height: 24px;
-    border-radius: 12px;
-    background: root.checked ? Palette.accent : #ffffff26;
-    animate background { duration: 130ms; }
+    width: 46px;
+    height: 26px;
+    border-radius: 999px;
+    background: root.checked ? (root.hovered ? Palette.accent-hover : Palette.accent)
+        : (root.hovered ? #ffffff30 : #ffffff20);
+    drop-shadow-color: root.checked ? (root.hovered ? #5b8cff73 : #5b8cff33) : #00000000;
+    drop-shadow-blur: root.hovered ? 14px : 8px;
+    animate background, drop-shadow-color, drop-shadow-blur { duration: 120ms; easing: ease-out; }
 
     Rectangle {
-        x: root.checked ? 20px : 2px;
-        y: 2px;
-        width: 20px;
-        height: 20px;
-        border-radius: 10px;
+        x: root.checked ? parent.width - self.width - 4px : 4px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
         background: #ffffff;
-        animate x { duration: 130ms; easing: ease-out; }
+        drop-shadow-color: #00000066;
+        drop-shadow-blur: 6px;
+        drop-shadow-offset-y: 1px;
+        animate x { duration: 120ms; easing: ease-out; }
     }
 
-    TouchArea {
+    ta := TouchArea {
         mouse-cursor: pointer;
         clicked => {
             root.checked = !root.checked;
@@ -104,35 +158,48 @@ export component SToggle inherits Rectangle {
     }
 }
 
+// ---------------- slider ----------------
+
 export component SSlider inherits Rectangle {
     in-out property <float> value: 0.5;
+    out property <bool> hovered: ta.has-hover;
     callback changed(float);
 
-    height: 26px;
+    height: 28px;
+
+    // knob grows while hovered / dragged (size animation, no transforms)
+    property <length> knob-size: (ta.has-hover || ta.pressed) ? 18px : 14px;
+    animate knob-size { duration: 120ms; easing: ease-out; }
 
     Rectangle {
-        y: 11px;
-        height: 4px;
+        y: (parent.height - self.height) / 2;
         width: 100%;
-        border-radius: 2px;
-        background: #ffffff26;
-        Rectangle {
-            width: root.value * parent.width;
-            height: 100%;
-            border-radius: 2px;
-            background: Palette.accent;
-        }
+        height: 5px;
+        border-radius: 999px;
+        background: @linear-gradient(180deg, #ffffff26 0%, #ffffff12 100%);
+        border-width: 1px;
+        border-color: #ffffff0a;
     }
 
     Rectangle {
-        x: (root.width - 14px) * root.value;
-        y: 6px;
-        width: 14px;
-        height: 14px;
-        border-radius: 7px;
+        y: (parent.height - self.height) / 2;
+        width: root.value * parent.width;
+        height: 5px;
+        border-radius: 999px;
+        background: @linear-gradient(90deg, #4374ea 0%, Palette.accent 55%, Palette.accent-hover 100%);
+        animate width { duration: ta.pressed ? 0ms : 150ms; easing: ease-out; }
+    }
+
+    Rectangle {
+        x: (parent.width - self.width) * root.value;
+        y: (parent.height - self.height) / 2;
+        width: root.knob-size;
+        height: root.knob-size;
+        border-radius: 999px;
         background: #ffffff;
-        drop-shadow-color: #00000066;
-        drop-shadow-blur: 4px;
+        drop-shadow-color: (ta.has-hover || ta.pressed) ? #5b8cff80 : #00000080;
+        drop-shadow-blur: (ta.has-hover || ta.pressed) ? 12px : 6px;
+        animate width, height, x, y, drop-shadow-color, drop-shadow-blur { duration: 120ms; easing: ease-out; }
     }
 
     ta := TouchArea {
@@ -150,21 +217,174 @@ export component SSlider inherits Rectangle {
     }
 }
 
+// ---------------- text field ----------------
+
 export component SLineEdit inherits Rectangle {
     in-out property <string> text: "";
     in property <string> placeholder: "";
+    out property <bool> focused: ti.has-focus;
     callback accepted(string);
     callback edited(string);
 
-    height: 30px;
-    border-radius: 7px;
-    background: Palette.field;
+    height: 32px;
+    border-radius: Palette.radius-ctl;
+    background: ti.has-focus ? #0d1016 : Palette.field;
     border-width: 1px;
     border-color: ti.has-focus ? Palette.accent : Palette.line;
+    drop-shadow-color: ti.has-focus ? #5b8cff40 : #00000000;
+    drop-shadow-blur: 10px;
+    animate background, border-color, drop-shadow-color, drop-shadow-blur { duration: 140ms; easing: ease-out; }
+
+    // The text scrolls inside this box so a long value never spills over the
+    // neighbouring controls.
+    Rectangle {
+        x: 11px;
+        y: 0px;
+        width: parent.width - 22px;
+        height: parent.height;
+        clip: true;
+
+        ti := TextInput {
+            property <length> computed-x: 0px;
+            x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.computed-x));
+            width: max(parent.width - self.text-cursor-width, self.preferred-width);
+            height: 100%;
+            color: Palette.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            single-line: true;
+            selection-background-color: Palette.accent;
+            selection-foreground-color: #ffffff;
+            text <=> root.text;
+            cursor-position-changed(pos) => {
+                if pos.x + self.computed-x < 0px {
+                    self.computed-x = -pos.x;
+                } else if pos.x + self.computed-x > parent.width - self.text-cursor-width {
+                    self.computed-x = parent.width - pos.x - self.text-cursor-width;
+                }
+            }
+            edited => { root.edited(root.text); }
+            accepted => { root.accepted(root.text); }
+        }
+    }
+
+    Text {
+        x: 11px;
+        y: 0px;
+        width: parent.width - 22px;
+        height: parent.height;
+        text: root.placeholder;
+        color: Palette.dim2;
+        font-size: 13px;
+        vertical-alignment: center;
+        overflow: elide;
+        visible: root.text == "" && !ti.has-focus;
+    }
+
+    // No overlay on purpose: anything covering the field swallows the press and
+    // the caret then jumps to the text edge instead of the clicked character.
+
+}
+
+// ---------------- chips ----------------
+
+/// Pill used for route / theme / wheel tabs.
+export component SChip inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> selected: false;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    out property <bool> hovered: ta.has-hover;
+    callback clicked();
+
+    height: 32px;
+    min-width: 56px;
+    border-radius: 999px;
+    border-width: 1px;
+    border-color: !root.enabled ? transparent :
+        root.selected ? Palette.accent :
+        root.danger ? (root.hovered ? #e5484d80 : #e5484d40) :
+        (root.hovered ? Palette.line-strong : Palette.line);
+    background: !root.enabled ? #ffffff08 :
+        root.selected ? (root.hovered ? Palette.accent-hover : Palette.accent) :
+        root.danger ? (root.hovered ? #e5484d38 : #e5484d1a) :
+        (root.hovered ? #ffffff17 : #ffffff0b);
+    drop-shadow-color: root.selected ? (root.hovered ? #5b8cff66 : #5b8cff40) : #00000000;
+    drop-shadow-blur: root.hovered ? 14px : 8px;
+    animate background, border-color, drop-shadow-color, drop-shadow-blur { duration: 120ms; easing: ease-out; }
+
+    Text {
+        x: 12px;
+        y: 0px;
+        width: parent.width - 24px;
+        height: parent.height;
+        text: root.text;
+        color: !root.enabled ? Palette.dim2 :
+            root.selected ? #ffffff :
+            root.danger ? Palette.danger-hover :
+            (root.hovered ? Palette.text : Palette.dim);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 12px;
+        font-weight: root.selected ? 600 : 500;
+        overflow: elide;
+        animate color { duration: 120ms; easing: ease-out; }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if (root.enabled) {
+                root.clicked();
+            }
+        }
+    }
+}
+
+// ---------------- colour field ----------------
+
+export component SColorField inherits Rectangle {
+    in-out property <string> text: "#000000";
+    in property <color> swatch: #000000;
+    out property <bool> hovered: back.has-hover;
+    callback edited(string);
+
+    height: 32px;
+    border-radius: Palette.radius-ctl;
+    background: Palette.field;
+    border-width: 1px;
+    border-color: ti.has-focus ? Palette.accent : (back.has-hover ? Palette.line-strong : Palette.line);
+    drop-shadow-color: ti.has-focus ? #5b8cff40 : #00000000;
+    drop-shadow-blur: 10px;
+    animate border-color, drop-shadow-color, drop-shadow-blur { duration: 140ms; easing: ease-out; }
+
+    back := TouchArea {
+        clicked => { ti.focus(); }
+    }
+
+    // the swatch grows by 2px on hover (no transforms on this renderer)
+    Rectangle {
+        x: 4px;
+        y: (parent.height - self.height) / 2;
+        width: swatch-ta.has-hover ? 26px : 24px;
+        height: self.width;
+        border-radius: 7px;
+        background: root.swatch;
+        border-width: 1px;
+        border-color: #ffffff40;
+        drop-shadow-color: #00000073;
+        drop-shadow-blur: 6px;
+        animate width, height { duration: 120ms; easing: ease-out; }
+    }
+
+    swatch-ta := TouchArea {
+        mouse-cursor: pointer;
+    }
 
     ti := TextInput {
-        x: 9px;
-        width: parent.width - 18px;
+        x: 38px;
+        y: 0px;
+        width: parent.width - 48px;
         height: parent.height;
         color: Palette.text;
         font-size: 13px;
@@ -172,94 +392,76 @@ export component SLineEdit inherits Rectangle {
         single-line: true;
         text <=> root.text;
         edited => { root.edited(root.text); }
-        accepted => { root.accepted(root.text); }
+        accepted => { root.edited(root.text); }
     }
 
     Text {
-        x: 9px;
-        width: parent.width - 18px;
+        x: 38px;
+        y: 0px;
+        width: parent.width - 48px;
         height: parent.height;
-        text: root.placeholder;
-        color: Palette.dim;
+        text: "#RRGGBB";
+        color: Palette.dim2;
         font-size: 13px;
         vertical-alignment: center;
         visible: root.text == "" && !ti.has-focus;
     }
-
-    TouchArea {
-        clicked => { ti.focus(); }
-    }
 }
 
-/// Selectable pill used for route / theme / wheel tabs.
-export component SChip inherits Rectangle {
-    in property <string> text: "";
-    in property <bool> selected: false;
-    in property <bool> danger: false;
-    callback clicked();
+// ---------------- layout helpers ----------------
 
-    height: 28px;
-    min-width: 56px;
-    border-radius: 14px;
-    background: root.selected ? Palette.accent
-        : root.danger ? (ta.has-hover ? #e5545a : #3a2026)
-        : (ta.has-hover ? #343849 : #242631);
-
-    Text {
-        text: root.text;
-        color: Palette.text;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        font-size: 12px;
-    }
-
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-}
-
-/// Color swatch + hex text field.
-export component SColorField inherits Rectangle {
-    in-out property <string> text: "#000000";
-    in property <color> swatch: #000000;
-    callback edited(string);
-
-    height: 30px;
-
-    Rectangle {
-        width: 30px;
-        height: 30px;
-        border-radius: 7px;
-        background: root.swatch;
-        border-width: 1px;
-        border-color: #ffffff40;
-    }
-
-    SLineEdit {
-        x: 38px;
-        width: parent.width - 38px;
-        text <=> root.text;
-        placeholder: "#RRGGBB";
-        edited(t) => { root.edited(t); }
-    }
-}
-
-/// One settings row: fixed-width label on the left, control on the right.
+/// One settings row: fixed label column on the left, controls stretch to the
+/// right edge so cards are filled instead of leaving dead space.
 export component SRow inherits Rectangle {
     in property <string> label: "";
-    in property <string> hint: "";
-    height: 40px;
+    in property <length> label-width: 104px;
+    /// Dims the whole row (e.g. a group that is currently switched off).
+    in property <float> dim: 1.0;
 
-    SDimLabel {
-        x: 0px;
-        width: 150px;
-        height: parent.height;
-        text: root.label;
-        font-size: 13px;
-        color: Palette.text;
-        opacity: 0.85;
+    height: Palette.row-h;
+    opacity: root.dim;
+    animate opacity { duration: 150ms; easing: ease-out; }
+
+    HorizontalLayout {
+        spacing: 16px;
+        cross-axis-alignment: center;
+
+        Text {
+            width: root.label-width;
+            height: parent.height;
+            text: root.label;
+            color: Palette.text;
+            opacity: 0.86;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        @children
     }
+}
 
-    @children
+/// Rounded card that groups settings; optional 13px heading.
+export component SCard inherits Rectangle {
+    in property <string> title: "";
+    in property <color> edge: Palette.line;
+    in property <length> pad: 16px;
+
+    border-radius: Palette.radius-card;
+    // very light top-down gradient so cards read as glass instead of flat blocks
+    background: @linear-gradient(180deg, #1c2029 0%, #181b22 100%);
+    border-width: 1px;
+    border-color: root.edge;
+
+    VerticalLayout {
+        padding: root.pad;
+        spacing: 14px;
+
+        if root.title != "" : SSection {
+            height: 18px;
+            text: root.title;
+        }
+
+        @children
+    }
 }

@@ -1,4 +1,13 @@
-// Overlay window: radial wheel view and flat list view.
+// Overlay window: radial wheel and flat list.
+//
+// Animated state (all driven from Rust):
+//   reveal     false -> true on open, true -> false on close. Every entrance and
+//              exit transition hangs off it, staggered per item.
+//   wheel-swap false -> true after the item model was replaced, so switching
+//              wheels cross-fades the item ring instead of popping.
+//
+// The software renderer has no element transforms, so every zoom-like effect is
+// expressed as size animation around a re-derived origin.
 
 // ---- data models ----
 
@@ -7,9 +16,11 @@ export struct WheelItem {
     name: string,
     icon: image,
     has-icon: bool,
-    // SVG path commands of the pie sector (pixel coords inside the disc box)
+    // the fixed "open the list view" entry, which has a built-in icon
+    is-list: bool,
+    // SVG path commands of the pie sector (400x400 pixel space of the disc box)
     path: string,
-    // center of the icon+label content in the wheel view
+    // centre of the icon + label content inside the window
     cx: length,
     cy: length,
 }
@@ -19,11 +30,12 @@ export struct ListItem {
     name: string,
     icon: image,
     has-icon: bool,
-    // target y position of the card in the list view
-    cy: length,
+    // top-left corner of the card, in the list view
+    x: length,
+    y: length,
 }
 
-// ---- overlay (wheel + list) ----
+// ---- overlay ----
 
 export component OverlayWindow inherits Window {
     title: "NoKeys Overlay";
@@ -34,31 +46,38 @@ export component OverlayWindow inherits Window {
     in property <bool> show-wheel: true;
     in property <int> hovered: -1;
     in property <int> wheel-index: 1;
+    in property <int> wheel-total: 1;
     in property <bool> reveal: false;
+    in property <bool> wheel-swap: true;
 
-    in property <color> disc-tint: #3a3f4ecc;
-    in property <color> disc-tint-2: #171a22e0;
-    in property <color> disc-border: #ffffff1f;
-    in property <color> sector-stroke: #ffffff26;
-    in property <color> sector-hover: #ffffff2e;
-    in property <color> text-color: #ffffff;
-    in property <color> card-bg: #22242ed8;
-    in property <color> sub-text-color: #ffffffb0;
+    in property <color> disc-tint: #16191ff0;
+    in property <color> disc-tint-2: #0b0d12f5;
+    in property <color> disc-border: #ffffff2e;
+    in property <color> sector-stroke: #ffffff1c;
+    in property <color> sector-hover: #5b8cff2a;
+    in property <color> text-color: #f2f4f8;
+    in property <color> card-bg: #1b1e27e0;
+    in property <color> card-hover-bg: #222838f0;
+    in property <color> sub-text-color: #f2f4f8a8;
     in property <color> close-bg: #ffffff14;
-    in property <color> close-hover-bg: #ff5a5f66;
+    in property <color> close-hover-bg: #e5484ddd;
     in property <color> icon-ph-bg: #ffffff1a;
-    in property <color> icon-ph-line: #ffffff66;
-    in property <color> chip-bg: #00000038;
-    in property <color> disc-halo: #0000001a;
+    in property <color> icon-ph-line: #ffffff73;
+    in property <color> accent: #5b8cff;
+    in property <color> dot-bg: #ffffff59;
 
     in property <image> disc-image;
     in property <bool> disc-image-set: false;
-    in property <color> blur-tint: #1f243099;
-    in property <color> blur-tint-2: #171a22aa;
+    in property <color> blur-tint: #1a1f2bcc;
+    in property <color> blur-tint-2: #0a0c11ee;
+
+    // Card size of the list view grid (set from Rust, 4:3).
+    in property <length> list-card-w: 120px;
+    in property <length> list-card-h: 90px;
 
     in property <bool> list-bg-enabled: false;
-    in property <color> list-bg-color: #1e1e2e;
-    in property <float> list-bg-opacity: 0.5;
+    in property <color> list-bg-color: #16171d;
+    in property <float> list-bg-opacity: 0.85;
     in property <image> list-bg-image;
     in property <bool> list-bg-image-set: false;
 
@@ -80,33 +99,27 @@ export component OverlayWindow inherits Window {
         width: parent.width;
         height: parent.height;
 
-        // full-window area for hover/click detection (behind the X button)
+        // Whole-window cursor tracking; sits behind the centre button so that
+        // button keeps its own hover state. TouchArea's "moved" callback only
+        // fires while the pointer is grabbed, so plain hover has to come from
+        // the raw pointer event stream.
         hover-area := TouchArea {
-            moved => { root.hover-at(self.mouse-x, self.mouse-y); }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.move) {
+                    root.hover-at(self.mouse-x, self.mouse-y);
+                }
+            }
             clicked => { root.click-at(self.mouse-x, self.mouse-y); }
         }
 
-        wheel-group := Rectangle {
-            x: 0px;
-            y: root.reveal ? 0px : 48px;
-            width: parent.width;
-            height: parent.height;
+        group := Rectangle {
+            y: root.reveal ? 0px : 16px;
             opacity: root.reveal ? 1.0 : 0.0;
 
             animate y { duration: root.slide-dur; easing: ease-out; }
             animate opacity { duration: root.fade-dur; easing: ease-out; }
 
-            // soft halo so the disc separates from busy desktops
-            Rectangle {
-                x: 34px;
-                y: 34px;
-                width: 412px;
-                height: 412px;
-                border-radius: 206px;
-                background: root.disc-halo;
-            }
-
-            // frosted disc base
+            // frosted disc
             disc := Rectangle {
                 x: 40px;
                 y: 40px;
@@ -117,22 +130,44 @@ export component OverlayWindow inherits Window {
                 background: root.disc-tint;
                 border-width: 1px;
                 border-color: root.disc-border;
-                drop-shadow-color: #00000055;
-                drop-shadow-blur: 28px;
-                drop-shadow-offset-y: 8px;
+                // The disc has no fill of its own: it is either fully transparent
+                // (the wheel floats on the desktop) or shows the frosted snapshot
+                // of what is behind it. A shadow only makes sense in the latter
+                // case, otherwise it would shade an empty circle.
+                drop-shadow-color: root.disc-image-set ? #0000004d : #00000000;
+                drop-shadow-blur: 30px;
+                drop-shadow-offset-y: 10px;
+                animate drop-shadow-color { duration: 150ms; }
 
-                // blurred desktop captured behind the overlay
                 if root.disc-image-set : Image {
                     width: 100%;
                     height: 100%;
                     source: root.disc-image;
                     image-fit: fill;
                 }
-                // configurable tint over the blurred backdrop
                 if root.disc-image-set : Rectangle {
                     width: 100%;
                     height: 100%;
-                    background: @linear-gradient(180deg, root.blur-tint 0%, root.blur-tint-2 100%);
+                    background: @linear-gradient(200deg, root.blur-tint 0%, root.blur-tint-2 100%);
+                }
+                // top light so the frosted disc reads as glass instead of a flat circle
+                Rectangle {
+                    y: 0px;
+                    width: 100%;
+                    height: 52%;
+                    background: @linear-gradient(180deg, #ffffff12 0%, #ffffff00 100%);
+                    opacity: root.disc-image-set ? 1.0 : 0.0;
+                    animate opacity { duration: 150ms; }
+                }
+                // inner rim
+                Rectangle {
+                    x: 1px;
+                    y: 1px;
+                    width: parent.width - 2px;
+                    height: parent.height - 2px;
+                    border-radius: 199px;
+                    border-width: 1px;
+                    border-color: #ffffff0a;
                 }
             }
 
@@ -151,123 +186,166 @@ export component OverlayWindow inherits Window {
                 fill: i == root.hovered ? root.sector-hover : transparent;
                 stroke: root.sector-stroke;
                 stroke-width: 1px;
+                opacity: root.reveal ? 1.0 : 0.0;
                 animate fill { duration: root.hover-dur; }
+                animate opacity { duration: root.fade-dur; delay: i * root.stagger-dur; }
             }
 
-            // item content (icon + label), above the sectors.
-            // Scaling is done by animating the box size around its centre, because the
-            // software renderer (chosen for low memory) does not support transforms.
+            // accent rim on the hovered sector, one step above the fill
+            for item[i] in root.wheel-items : Path {
+                x: 40px;
+                y: 40px;
+                width: 400px;
+                height: 400px;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 400;
+                viewbox-height: 400;
+                fit: fill;
+                commands: item.path;
+                fill: transparent;
+                stroke: root.accent;
+                stroke-width: 2px;
+                opacity: i == root.hovered && root.reveal ? 0.95 : 0.0;
+                animate opacity { duration: root.hover-dur; }
+            }
+
+            // icon + label per sector
             for item[i] in root.wheel-items : Rectangle {
+                width: i == root.hovered ? 112px : 100px;
+                height: i == root.hovered ? 80px : 70px;
                 x: item.cx - self.width / 2;
                 y: item.cy - self.height / 2;
-                width: i == root.hovered ? 118px : 104px;
-                height: i == root.hovered ? 84px : 72px;
-                opacity: i == root.hovered ? 0.72 : 1.0;
-                animate width, height, x, y { duration: root.hover-dur; easing: ease-out; }
-                animate opacity { duration: root.hover-dur; }
+                opacity: root.reveal && root.wheel-swap ? 1.0 : 0.0;
 
-                // small card behind the icon + label (no big backdrop)
-                Rectangle {
-                    width: 100%;
-                    height: 100%;
-                    border-radius: 16px;
-                    background: root.chip-bg;
-                }
+                animate width, height { duration: root.hover-dur; easing: ease-out; }
+                animate opacity { duration: root.fade-dur; delay: i * root.stagger-dur; }
 
-                // icon
                 if item.has-icon : Image {
                     x: (parent.width - self.width) / 2;
-                    y: 8px;
+                    y: i == root.hovered ? 9px : 8px;
                     width: i == root.hovered ? 40px : 36px;
                     height: i == root.hovered ? 40px : 36px;
                     source: item.icon;
                     image-fit: contain;
-                    animate width, height, x { duration: root.hover-dur; easing: ease-out; }
+                    animate width, height, x, y { duration: root.hover-dur; easing: ease-out; }
                 }
-                if !item.has-icon : Rectangle {
+                // Built-in icon for the fixed "list view" entry.
+                if !item.has-icon && item.is-list : Path {
                     x: (parent.width - self.width) / 2;
-                    y: 8px;
-                    width: i == root.hovered ? 40px : 36px;
-                    height: i == root.hovered ? 40px : 36px;
-                    border-radius: 10px;
-                    background: root.icon-ph-bg;
-                    border-width: 1px;
-                    border-color: root.icon-ph-line;
-                    animate width, height, x { duration: root.hover-dur; easing: ease-out; }
+                    y: i == root.hovered ? 13px : 12px;
+                    width: i == root.hovered ? 32px : 28px;
+                    height: i == root.hovered ? 32px : 28px;
+                    viewbox-width: 24;
+                    viewbox-height: 24;
+                    fit: fill;
+                    commands: "M 3 5.5 H 21 M 3 12 H 21 M 3 18.5 H 21 M 4.4 5.5 H 4.6 M 4.4 12 H 4.6 M 4.4 18.5 H 4.6";
+                    stroke: i == root.hovered ? root.accent : root.text-color;
+                    stroke-width: 1.7px;
+                    stroke-line-cap: round;
+                    fill: transparent;
+                    opacity: i == root.hovered ? 1.0 : 0.85;
+                    animate width, height, x, y, stroke, opacity { duration: root.hover-dur; easing: ease-out; }
+                }
 
-                    Path {
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2;
-                        width: 18px;
-                        height: 18px;
-                        viewbox-width: 18;
-                        viewbox-height: 18;
-                        fit: fill;
-                        commands: "M 4 2 L 12 2 L 16 6 L 16 16 L 2 16 L 2 2 Z";
-                        stroke: root.icon-ph-line;
-                        stroke-width: 1.4px;
-                        fill: transparent;
-                    }
+                // No icon set: draw a bare glyph, no frame behind it.
+                if !item.has-icon && !item.is-list : Path {
+                    x: (parent.width - self.width) / 2;
+                    y: i == root.hovered ? 13px : 12px;
+                    width: i == root.hovered ? 32px : 28px;
+                    height: i == root.hovered ? 32px : 28px;
+                    viewbox-width: 16;
+                    viewbox-height: 16;
+                    fit: fill;
+                    commands: "M 2 2 L 14 2 L 14 14 L 2 14 Z M 5 11 L 7.4 8.4 L 9 10 L 11 7";
+                    stroke: i == root.hovered ? root.accent : root.icon-ph-line;
+                    stroke-width: 1.3px;
+                    fill: transparent;
+                    animate width, height, x, y, stroke { duration: root.hover-dur; easing: ease-out; }
                 }
 
                 Text {
                     x: 2px;
-                    y: parent.height - 24px;
+                    y: parent.height - 22px;
                     width: parent.width - 4px;
                     height: 18px;
                     text: item.name;
-                    color: root.text-color;
+                    color: i == root.hovered ? root.accent : root.text-color;
                     horizontal-alignment: center;
-                    font-size: 13px;
+                    font-size: 12.5px;
+                    font-weight: i == root.hovered ? 600 : 400;
                     overflow: elide;
-                    animate y { duration: root.hover-dur; easing: ease-out; }
+                    opacity: i == root.hovered ? 1.0 : 0.82;
+                    animate opacity, font-weight, color { duration: root.hover-dur; }
                 }
             }
 
-            // center X (manual close)
-            x-button := Rectangle {
-                x: 216px;
-                y: 216px;
-                width: 48px;
-                height: 48px;
-                border-radius: 24px;
-                background: x-ta.has-hover ? root.close-hover-bg : root.close-bg;
+            // centre: wheel number, turns into the close button on hover
+            hub := Rectangle {
+                x: 210px;
+                y: 210px;
+                width: 60px;
+                height: 60px;
+                border-radius: 30px;
+                background: hub-ta.has-hover ? root.close-hover-bg : root.close-bg;
                 border-width: 1px;
-                border-color: root.disc-border;
-                animate background { duration: root.hover-dur; }
+                border-color: hub-ta.has-hover ? transparent : root.disc-border;
+                animate background, border-color { duration: root.hover-dur; }
 
-                Path {
-                    x: 14px;
-                    y: 14px;
-                    width: 20px;
-                    height: 20px;
-                    viewbox-width: 20;
-                    viewbox-height: 20;
-                    fit: fill;
-                    commands: "M 5 5 L 15 15 M 15 5 L 5 15";
-                    stroke: root.text-color;
-                    stroke-width: 1.8px;
-                    stroke-line-cap: round;
+                Text {
+                    width: 100%;
+                    height: 100%;
+                    text: root.wheel-index;
+                    color: root.text-color;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    font-size: 16px;
+                    font-weight: 600;
+                    opacity: hub-ta.has-hover ? 0.0 : 0.72;
+                    animate opacity { duration: 100ms; }
                 }
 
-                x-ta := TouchArea {
+                Path {
+                    x: 21px;
+                    y: 21px;
+                    width: 18px;
+                    height: 18px;
+                    viewbox-width: 18;
+                    viewbox-height: 18;
+                    fit: fill;
+                    commands: "M 4 4 L 14 14 M 14 4 L 4 14";
+                    stroke: #ffffff;
+                    stroke-width: 2px;
+                    stroke-line-cap: round;
+                    opacity: hub-ta.has-hover ? 1.0 : 0.0;
+                    animate opacity { duration: 100ms; }
+                }
+
+                hub-ta := TouchArea {
                     clicked => { root.close-requested(); }
                     mouse-cursor: pointer;
                 }
             }
 
-            // wheel index number (floating, below the disc)
-            Text {
+            // wheel pips, only when there is more than one wheel
+            if root.wheel-total > 1 : Rectangle {
                 x: 0px;
-                y: 448px;
-                width: parent.width;
-                height: 26px;
-                text: root.wheel-index;
-                color: root.text-color;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                font-size: 15px;
-                font-weight: 600;
+                y: 452px;
+                width: 480px;
+                height: 10px;
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    for p in root.wheel-total : Rectangle {
+                        width: p == root.wheel-index - 1 ? 18px : 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: p == root.wheel-index - 1 ? root.accent : root.dot-bg;
+                        opacity: root.reveal ? 1.0 : 0.0;
+                        animate width, background { duration: 180ms; easing: ease-out; }
+                        animate opacity { duration: 180ms; }
+                    }
+                }
             }
         }
     }
@@ -277,12 +355,11 @@ export component OverlayWindow inherits Window {
         width: parent.width;
         height: parent.height;
 
-        // empty area click -> close
+        // clicking anywhere that is not a card closes the overlay
         empty-ta := TouchArea {
             clicked => { root.close-requested(); }
         }
 
-        // optional background
         if root.list-bg-enabled : Rectangle {
             width: parent.width;
             height: parent.height;
@@ -298,52 +375,79 @@ export component OverlayWindow inherits Window {
         }
 
         for item[i] in root.list-items : Rectangle {
-            x: 36px;
-            y: root.reveal ? item.cy : item.cy + 24px;
-            width: parent.width - 72px;
-            height: 46px;
+            x: item.x;
+            y: root.reveal ? item.y : item.y + 14px;
+            width: root.list-card-w;
+            height: root.list-card-h;
             opacity: root.reveal ? 1.0 : 0.0;
             animate y { duration: root.slide-dur; delay: i * root.stagger-dur; easing: ease-out; }
             animate opacity { duration: root.fade-dur; delay: i * root.stagger-dur; easing: ease-out; }
 
+            // 4:3 card: icon in the middle, name underneath. Hover lifts the card
+            // and lights its border; no transforms exist in the software
+            // renderer, so the lift is a two pixel move plus a deeper shadow.
             card := Rectangle {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: parent.width + (i == root.hovered ? 10px : 0px);
-                height: parent.height + (i == root.hovered ? 6px : 0px);
-                border-radius: 12px;
-                background: root.card-bg;
-                opacity: i == root.hovered ? 0.7 : 1.0;
-                animate width, height, x, y { duration: root.hover-dur; easing: ease-out; }
-                animate opacity { duration: root.hover-dur; }
+                x: 0px;
+                y: i == root.hovered ? -3px : 0px;
+                width: parent.width;
+                height: parent.height;
+                border-radius: 14px;
+                background: i == root.hovered ? root.card-hover-bg : root.card-bg;
+                border-width: 1px;
+                border-color: i == root.hovered ? root.accent.transparentize(0.2) : #ffffff12;
+                drop-shadow-color: i == root.hovered ? #00000066 : #0000003d;
+                drop-shadow-blur: i == root.hovered ? 22px : 12px;
+                drop-shadow-offset-y: i == root.hovered ? 8px : 4px;
+                animate y, background, border-color, drop-shadow-color, drop-shadow-blur, drop-shadow-offset-y { duration: root.hover-dur; easing: ease-out; }
 
                 if item.has-icon : Image {
-                    x: 10px;
-                    y: 5px;
-                    width: 36px;
-                    height: 36px;
+                    x: (parent.width - self.width) / 2;
+                    y: i == root.hovered ? 18px : 20px;
+                    width: i == root.hovered ? 44px : 40px;
+                    height: i == root.hovered ? 44px : 40px;
                     source: item.icon;
                     image-fit: contain;
+                    animate width, height, x, y { duration: root.hover-dur; easing: ease-out; }
                 }
                 if !item.has-icon : Rectangle {
-                    x: 10px;
-                    y: 5px;
-                    width: 36px;
-                    height: 36px;
-                    border-radius: 10px;
+                    x: (parent.width - self.width) / 2;
+                    y: i == root.hovered ? 18px : 20px;
+                    width: i == root.hovered ? 44px : 40px;
+                    height: i == root.hovered ? 44px : 40px;
+                    border-radius: 12px;
                     background: root.icon-ph-bg;
                     border-width: 1px;
-                    border-color: root.icon-ph-line;
+                    border-color: i == root.hovered ? root.accent.transparentize(0.3) : root.icon-ph-line;
+                    animate width, height, x, y, border-color { duration: root.hover-dur; easing: ease-out; }
+
+                    Path {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        width: 16px;
+                        height: 16px;
+                        viewbox-width: 16;
+                        viewbox-height: 16;
+                        fit: fill;
+                        commands: "M 2 2 L 14 2 L 14 14 L 2 14 Z";
+                        stroke: root.icon-ph-line;
+                        stroke-width: 1.3px;
+                        fill: transparent;
+                    }
                 }
+
                 Text {
-                    x: 56px;
-                    width: parent.width - 66px;
-                    height: parent.height;
+                    x: 6px;
+                    y: parent.height - 28px;
+                    width: parent.width - 12px;
+                    height: 20px;
                     text: item.name;
-                    color: root.text-color;
+                    color: i == root.hovered ? root.accent : root.text-color;
+                    horizontal-alignment: center;
                     vertical-alignment: center;
-                    font-size: 14px;
+                    font-size: 12.5px;
+                    font-weight: i == root.hovered ? 600 : 400;
                     overflow: elide;
+                    animate font-weight, color { duration: root.hover-dur; }
                 }
             }
 

@@ -1,0 +1,26 @@
+// Resident tray icon: the app has no always-visible window, so this is the
+// only way back to the settings dialog and the only way to quit it.
+
+export component TrayIcon inherits SystemTrayIcon {
+    // Constant on purpose: Slint only accepts a compile-time image here.
+    icon: @image-url("tray.png");
+    tooltip: "NoKeys — 按住热键唤出轮盘";
+
+    callback open-settings();
+    callback quit-app();
+
+    // Left click on the icon is the fastest way back to the settings.
+    clicked => { root.open-settings(); }
+
+    Menu {
+        MenuItem {
+            title: "打开设置";
+            activated => { root.open-settings(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "退出 NoKeys";
+            activated => { root.quit-app(); }
+        }
+    }
+}

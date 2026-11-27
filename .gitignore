@@ -1,3 +1,5 @@
 /target
 *.log
+/_shots
 *.png
+!ui/tray.png
