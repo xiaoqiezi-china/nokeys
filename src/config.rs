@@ -211,7 +211,8 @@ impl Action {
         let text = previous.param().to_string();
         let args = previous.args().to_string();
         match kind {
-            1 => Action::Shortcut { keys: text },
+            // A shortcut is bound by pressing it, so it never inherits text.
+            1 => Action::Shortcut { keys: String::new() },
             2 => Action::Program { path: text, args },
             3 => Action::Text { text },
             4 => Action::Command { cmd: text },

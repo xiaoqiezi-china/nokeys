@@ -64,6 +64,9 @@ component RailItem inherits Rectangle {
 // third line (programs only) holds the command line arguments.
 component EditRow inherits Rectangle {
     in property <EditItem> item;
+    /// This row is waiting for the chord that its shortcut action should send.
+    in property <bool> binding: false;
+    in property <string> capture-hint: "";
     callback rename(string);
     callback pick-icon();
     callback clear();
@@ -71,6 +74,8 @@ component EditRow inherits Rectangle {
     callback set-param(string);
     callback set-args(string);
     callback pick-program();
+    callback bind-shortcut();
+    callback cancel-bind();
 
     // 0 虚拟键, 1 程序, 2 文本, 3 命令, 4 网页
     property <bool> is-program: root.item.action-kind == 2;
@@ -234,17 +239,60 @@ component EditRow inherits Rectangle {
                 clicked => { root.set-kind(5); }
             }
 
-            if !root.item.is-list-entry : SLineEdit {
+            if !root.item.is-list-entry && root.item.action-kind != 1 : SLineEdit {
                 horizontal-stretch: 1;
                 height: 26px;
                 text: root.item.action-param;
                 placeholder: root.item.action-kind == 0 ? "留空=发 " + root.item.vk-name + "（保留键）；要绑到游戏/软件里就填对方认识的键，如 F8、Ctrl+Alt+M"
-                    : root.item.action-kind == 1 ? "要发送的组合，例如 Ctrl+Alt+M、F8"
                     : root.item.action-kind == 2 ? "程序路径"
                     : root.item.action-kind == 3 ? "要键入的文本，可用 {date} {time} {clipboard}"
                     : root.item.action-kind == 4 ? "cmd 命令，例如 shutdown /s /t 0"
                     : "网址，例如 https://example.com";
                 edited(t) => { root.set-param(t); }
+            }
+
+            // A shortcut is pressed, not typed: the box shows what is bound and
+            // clicking it (or 绑定) captures the next chord.
+            if !root.item.is-list-entry && root.item.action-kind == 1 : Rectangle {
+                horizontal-stretch: 1;
+                height: 26px;
+                border-radius: Palette.radius-ctl;
+                background: root.binding ? #101826 : Palette.field;
+                border-width: 1px;
+                border-color: root.binding
+                    ? (root.capture-hint == "" ? Palette.accent : Palette.danger)
+                    : Palette.line;
+                animate background, border-color { duration: 140ms; easing: ease-out; }
+
+                Text {
+                    x: 11px;
+                    width: parent.width - 22px;
+                    height: parent.height;
+                    text: root.binding
+                        ? (root.capture-hint == "" ? "请按下要发送的组合…（Esc 取消）" : root.capture-hint)
+                        : (root.item.action-param == "" ? "未绑定" : root.item.action-param);
+                    color: root.binding
+                        ? (root.capture-hint == "" ? Palette.accent : Palette.danger)
+                        : (root.item.action-param == "" ? Palette.dim2 : Palette.text);
+                    font-size: 13px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.bind-shortcut(); }
+                }
+            }
+
+            if !root.item.is-list-entry && root.item.action-kind == 1 : SButton {
+                width: 64px;
+                height: 26px;
+                text: root.binding ? "取消" : "绑定";
+                primary: !root.binding;
+                clicked => {
+                    if (root.binding) { root.cancel-bind(); } else { root.bind-shortcut(); }
+                }
             }
 
             if !root.item.is-list-entry && root.is-program : SButton {
@@ -348,6 +396,11 @@ export component SettingsWindow inherits Window {
     callback set-card-opacity(float);
     callback set-list-columns(int);
 
+    // Row whose shortcut is being bound (-1 = none)
+    in-out property <int> capture-wheel: -1;
+    in-out property <int> capture-slot: -1;
+
+    callback bind-item-shortcut(int, int);
     callback set-item-action-kind(int, int, int);
     callback set-item-action-param(int, int, string);
     callback set-item-action-args(int, int, string);
@@ -383,6 +436,13 @@ export component SettingsWindow inherits Window {
         "配置与会话数据以 JSON 保存在本机，不上传、不导入导出。";
 
     property <int> active-page: Math.max(0, Math.min(4, root.page));
+
+    // Nothing is drawn here; it exists so the UI can move the focus away from a
+    // text field (Slint has no "clear focus" call).
+    focus-sink := FocusScope {
+        width: 0px;
+        height: 0px;
+    }
 
     HorizontalLayout {
         // ================= SIDEBAR =================
@@ -581,6 +641,14 @@ export component SettingsWindow inherits Window {
                         width: 100%;
                         height: body.preferred-height;
 
+                        // Clicking empty page space drops the text caret. It sits
+                        // below the page content, so every control still gets its
+                        // own clicks first.
+                        FocusScope {
+                            width: 100%;
+                            height: 100%;
+                        }
+
                         body := VerticalLayout {
                             padding-left: 24px;
                             padding-right: 30px;
@@ -645,6 +713,7 @@ export component SettingsWindow inherits Window {
                                                     mouse-cursor: root.capturing ? default : pointer;
                                                     clicked => {
                                                         if (!root.capturing) {
+                                                            focus-sink.focus();
                                                             root.request-capture();
                                                         }
                                                     }
@@ -795,6 +864,10 @@ export component SettingsWindow inherits Window {
                                                 width: parent.width;
                                                 height: item.action-kind == 2 ? 114px : 82px;
                                                 item: item;
+                                                binding: root.capturing
+                                                    && root.capture-wheel == item.wheel
+                                                    && root.capture-slot == item.slot;
+                                                capture-hint: root.capture-hint;
                                                 rename(t) => { root.set-item-name(item.wheel, item.slot, t); }
                                                 pick-icon => { root.pick-item-icon(item.wheel, item.slot); }
                                                 clear => { root.clear-item(item.wheel, item.slot); }
@@ -802,6 +875,13 @@ export component SettingsWindow inherits Window {
                                                 set-param(p) => { root.set-item-action-param(item.wheel, item.slot, p); }
                                                 set-args(a) => { root.set-item-action-args(item.wheel, item.slot, a); }
                                                 pick-program => { root.pick-item-program(item.wheel, item.slot); }
+                                                bind-shortcut => {
+                                                    // Drop any text caret first: the chord
+                                                    // keys must not be typed into a field.
+                                                    focus-sink.focus();
+                                                    root.bind-item-shortcut(item.wheel, item.slot);
+                                                }
+                                                cancel-bind => { root.cancel-capture(); }
                                             }
                                         }
                                     }

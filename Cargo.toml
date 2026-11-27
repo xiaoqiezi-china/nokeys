@@ -1,7 +1,9 @@
 [package]
 name = "nokeys"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "Windows 全局轮盘 / 列表快捷启动器"
+authors = ["xiaoqie"]
 
 [dependencies]
 slint = "1"
@@ -19,8 +21,19 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Memory",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    # installer (src/bin/setup.rs)
+    "Win32_System_Com",
+    "Win32_System_Registry",
 ] }
 rfd = "0.18.0"
+
+[[bin]]
+name = "nokeys"
+path = "src/main.rs"
+
+[[bin]]
+name = "setup"
+path = "src/bin/setup.rs"
 
 [build-dependencies]
 slint-build = "1"

@@ -20,21 +20,23 @@
 // Rebinding is handled by the same poller: it watches for key edges and turns
 // the first acceptable one into Captured.
 
-use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, SetCursorPos,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, HHOOK,
+    KBDLLHOOKSTRUCT,
     MSLLHOOKSTRUCT, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP,
-    WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::config::Hotkey;
@@ -49,6 +51,8 @@ pub enum HotkeyEvent {
     Up,
     /// Mouse wheel delta while the overlay is engaged (wheel switching).
     Wheel(i32),
+    /// The pointer moved while the overlay is engaged (throttled to ~60 Hz).
+    Moved,
     /// A new hotkey was captured during rebinding.
     Captured(Hotkey),
     /// Rebinding was aborted with Esc (or timed out).
@@ -100,6 +104,41 @@ static STAT_SWALLOWED: AtomicU32 = AtomicU32::new(0);
 // two paths may be allowed to own the trigger at a time.
 static KB_BEAT: AtomicU32 = AtomicU32::new(0);
 static MS_BEAT: AtomicU32 = AtomicU32::new(0);
+/// Tick of the last forwarded pointer move, so the hook cannot flood the channel.
+static MOVE_TICK: AtomicU32 = AtomicU32::new(0);
+
+// ----- pointer taken over while the wheel is open -----
+//
+// Full-screen games keep the cursor glued to the middle of their window and read
+// the offset themselves, so the cursor position carries no information there and
+// the game keeps turning the camera. While the wheel is open the hook therefore
+// holds the cursor on one point and accumulates the movement itself: the game
+// polls a standstill, and the wheel follows the push.
+const PIN_NONE: i32 = i32::MIN;
+static PIN_X: AtomicI32 = AtomicI32::new(PIN_NONE);
+static PIN_Y: AtomicI32 = AtomicI32::new(0);
+static PUSH_X: AtomicI32 = AtomicI32::new(0);
+static PUSH_Y: AtomicI32 = AtomicI32::new(0);
+/// Overlay window, so clicks on it can be told apart from clicks on the app behind.
+static OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
+pub fn set_overlay_hwnd(hwnd: isize) {
+    OVERLAY_HWND.store(hwnd, Ordering::Relaxed);
+}
+
+/// Start holding the pointer at the given point, or stop with None.
+pub fn set_pin_point(pos: Option<(i32, i32)>) {
+    let (x, y) = pos.unwrap_or((PIN_NONE, 0));
+    PIN_X.store(x, Ordering::Relaxed);
+    PIN_Y.store(y, Ordering::Relaxed);
+    PUSH_X.store(0, Ordering::Relaxed);
+    PUSH_Y.store(0, Ordering::Relaxed);
+}
+
+/// Movement accumulated since the pointer was pinned, in physical pixels.
+pub fn push_vector() -> (i32, i32) {
+    (PUSH_X.load(Ordering::Relaxed), PUSH_Y.load(Ordering::Relaxed))
+}
 static STAT_CAPTURE_HITS: AtomicU32 = AtomicU32::new(0);
 
 pub fn stat_keys() -> u32 {
@@ -300,13 +339,10 @@ unsafe extern "system" fn kb_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
                     return LRESULT(1);
                 }
             }
-            // While the overlay is up the whole keyboard stays with us. This is
-            // tied to the overlay being visible, not to any internal flag: the
-            // old sticky state is what used to leave machines with no keyboard.
-            if SWALLOW.load(Ordering::Relaxed) == 1 && HELD.load(Ordering::Relaxed) == 1 {
-                STAT_SWALLOWED.fetch_add(1, Ordering::Relaxed);
-                return LRESULT(1);
-            }
+            // Everything else keeps reaching the application on purpose: the
+            // wheel only takes the pointer over, so the game stays playable
+            // while a function is picked. Swallowing the whole keyboard here is
+            // what used to freeze the game for no visible reason.
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -322,6 +358,42 @@ unsafe extern "system" fn ms_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
             let delta = ((info.mouseData >> 16) & 0xFFFF) as i16 as i32;
             emit(HotkeyEvent::Wheel(delta));
             return LRESULT(1);
+        }
+        // While the wheel is open the pointer belongs to us: hold it on the pin
+        // point and collect what the user pushed instead.
+        let pin_x = PIN_X.load(Ordering::Relaxed);
+        if msg == WM_MOUSEMOVE && pin_x != PIN_NONE && SWALLOW.load(Ordering::Relaxed) == 1 {
+            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+            let pin_y = PIN_Y.load(Ordering::Relaxed);
+            let (dx, dy) = (info.pt.x - pin_x, info.pt.y - pin_y);
+            if dx != 0 || dy != 0 {
+                PUSH_X.fetch_add(dx, Ordering::Relaxed);
+                PUSH_Y.fetch_add(dy, Ordering::Relaxed);
+                // Putting the cursor back is what makes a game that polls the
+                // position see a standstill; ClipCursor could not, because a
+                // clamped cursor reports no movement at all.
+                let _ = unsafe { SetCursorPos(pin_x, pin_y) };
+                let now = unsafe { GetTickCount() };
+                if now.wrapping_sub(MOVE_TICK.load(Ordering::Relaxed)) >= 16 {
+                    MOVE_TICK.store(now, Ordering::Relaxed);
+                    emit(HotkeyEvent::Moved);
+                }
+            }
+            return LRESULT(1);
+        }
+        // The buttons belong to the wheel as well while it holds the pointer: a
+        // click must never reach the game behind it. Clicks on the overlay itself
+        // still work, so a clamped overlay can be closed from its own button.
+        if PIN_X.load(Ordering::Relaxed) != PIN_NONE && SWALLOW.load(Ordering::Relaxed) == 1 {
+            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+            let (button, _, _) = mouse_msg(msg, info);
+            if button != 0 {
+                let our = OVERLAY_HWND.load(Ordering::Relaxed);
+                let hit = unsafe { WindowFromPoint(info.pt) };
+                if our == 0 || hit.0 as isize != our {
+                    return LRESULT(1);
+                }
+            }
         }
         let chord_mouse = MOUSE_VK.load(Ordering::Relaxed);
         if chord_mouse != 0 && CAPTURING.load(Ordering::Relaxed) == 0 {

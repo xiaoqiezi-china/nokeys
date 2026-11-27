@@ -29,7 +29,8 @@ const DISC_R: f32 = DISC_D / 2.0;
 const DISC_CX: f32 = DISC_X + DISC_R; // 240
 const DISC_CY: f32 = DISC_Y + DISC_R; // 240
 const CONTENT_R: f32 = 134.0;
-const HUB_R: f32 = 30.0;
+/// A push shorter than this does not count as a direction yet.
+const DIR_DEAD_ZONE: f32 = 12.0;
 
 // List view: a grid of 4:3 cards, icons in the middle, title underneath.
 const LIST_MARGIN: f32 = 28.0;
@@ -54,6 +55,8 @@ struct AppState {
     list_ids: Vec<u32>,
     /// settings dialog is waiting for a hotkey chord
     capturing: bool,
+    /// Wheel item that receives the next captured chord (None = global hotkey).
+    capture_item: Option<(usize, usize)>,
     /// wheel selected in the settings dialog
     selected_wheel: usize,
     /// device-pixel top-left of the overlay window, for cursor hit-testing
@@ -63,6 +66,9 @@ struct AppState {
     /// cursor position when the overlay opened; the overlay only activates an
     /// item once the pointer actually moved away from it
     open_cursor: (i32, i32),
+    /// the wheel took the pointer over, so selection follows the push vector
+    /// instead of the cursor position
+    pinned: bool,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -79,6 +85,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 println!("{} {step}", if ok { "PASS" } else { "FAIL" });
             }
             for (step, ok) in config::selftest() {
+                println!("{} {step}", if ok { "PASS" } else { "FAIL" });
+            }
+            for (step, ok) in chord_selftest() {
                 println!("{} {step}", if ok { "PASS" } else { "FAIL" });
             }
         }
@@ -107,10 +116,12 @@ fn main() -> Result<(), slint::PlatformError> {
         view_is_wheel: true,
         list_ids: Vec::new(),
         capturing: false,
+        capture_item: None,
         selected_wheel: 0,
         overlay_origin: (0, 0),
         overlay_scale: 1.0,
         open_cursor: (0, 0),
+        pinned: false,
         config,
     }));
 
@@ -131,15 +142,15 @@ fn main() -> Result<(), slint::PlatformError> {
     // ---- overlay callbacks ----
     let state_hover = state.clone();
     let overlay_weak_hover = overlay.as_weak();
-    overlay.on_hover_at(move |x: f32, y: f32| {
+    overlay.on_hover_at(move |_x: f32, _y: f32| {
         if let Some(ov) = overlay_weak_hover.upgrade() {
-            let st = state_hover.lock().unwrap();
-            let idx = if st.view_is_wheel {
-                wheel_sector_at(x, y, &st)
-            } else {
-                grid_index_at(x, y, &st)
+            // The window-local coordinates Slint reports go stale as soon as the
+            // pointer leaves the window or the disc had to be clamped to the
+            // screen edge, so the real cursor drives the highlight instead.
+            let idx = {
+                let st = state_hover.lock().unwrap();
+                item_index_at_cursor(&st)
             };
-            drop(st);
             ov.set_hovered(idx);
         }
     });
@@ -205,7 +216,7 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Some(ov) = overlay_weak_pw.upgrade() {
             let mut st = state_pw.lock().unwrap();
             let idx = st.current_wheel.min(st.config.wheels.len().saturating_sub(1));
-            open_overlay_view(&ov, &mut st, true, idx, false);
+            open_overlay_view(&ov, &mut st, &state_pw, true, idx, false);
         }
     });
 
@@ -215,7 +226,7 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Some(ov) = overlay_weak_pl.upgrade() {
             let mut st = state_pl.lock().unwrap();
             let idx = st.current_wheel.min(st.config.wheels.len().saturating_sub(1));
-            open_overlay_view(&ov, &mut st, false, idx, false);
+            open_overlay_view(&ov, &mut st, &state_pl, false, idx, false);
         }
     });
 
@@ -282,7 +293,11 @@ fn main() -> Result<(), slint::PlatformError> {
                     ntrace!("capture cancelled");
                     hotkey::set_capturing(false);
                     if let Some(se) = &se {
-                        st.lock().unwrap().capturing = false;
+                        {
+                            let mut state = st.lock().unwrap();
+                            state.capturing = false;
+                            state.capture_item = None;
+                        }
                         se.set_capture_hint("".into());
                         sync_settings(se, &st);
                     }
@@ -306,23 +321,52 @@ fn main() -> Result<(), slint::PlatformError> {
                     if let Some(se) = &se {
                         let mut state = st.lock().unwrap();
                         ntrace!("captured hk={hk:?} capturing={}", state.capturing);
+                        let target = state.capture_item.take();
                         if state.capturing {
                             state.capturing = false;
-                            state.config.hotkey = hk;
-                            hotkey::set_hotkey(hk);
-                            config::save(&state.config).ok();
-                            drop(state);
-                            se.set_capture_hint("".into());
-                            sync_settings(se, &st);
-                            // Flash the field so an accepted rebound is visible even
-                            // when the chord did not change.
-                            let weak = se.as_weak();
-                            se.set_bind_flash(true);
-                            slint::Timer::single_shot(std::time::Duration::from_millis(1400), move || {
-                                if let Some(se) = weak.upgrade() {
-                                    se.set_bind_flash(false);
+                            match target {
+                                Some((wi, si)) => {
+                                    let text = chord_text(&hk);
+                                    if let (Some(text), Some(item)) = (
+                                        &text,
+                                        state
+                                            .config
+                                            .wheels
+                                            .get_mut(wi)
+                                            .and_then(|w| w.items.get_mut(si)),
+                                    ) {
+                                        ntrace!("item shortcut {wi}/{si} = {text:?}");
+                                        item.action = config::Action::Shortcut { keys: text.clone() };
+                                    }
+                                    config::save(&state.config).ok();
+                                    drop(state);
+                                    se.set_capture_hint(
+                                        if text.is_some() {
+                                            "".into()
+                                        } else {
+                                            "快捷键只能绑键盘组合，鼠标键请用其他动作".into()
+                                        },
+                                    );
+                                    sync_settings(se, &st);
                                 }
-                            });
+                                None => {
+                                    state.config.hotkey = hk;
+                                    hotkey::set_hotkey(hk);
+                                    config::save(&state.config).ok();
+                                    drop(state);
+                                    se.set_capture_hint("".into());
+                                    sync_settings(se, &st);
+                                    // Flash the field so an accepted rebound is visible
+                                    // even when the chord did not change.
+                                    let weak = se.as_weak();
+                                    se.set_bind_flash(true);
+                                    slint::Timer::single_shot(std::time::Duration::from_millis(1400), move || {
+                                        if let Some(se) = weak.upgrade() {
+                                            se.set_bind_flash(false);
+                                        }
+                                    });
+                                }
+                            }
                         }
                     }
                     return;
@@ -350,7 +394,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 if let Some(ov) = ow_open.upgrade() {
                     let mut st = state_open.lock().unwrap();
                     let idx = st.current_wheel.min(st.config.wheels.len().saturating_sub(1));
-                    open_overlay_view(&ov, &mut st, !as_list, idx, false);
+                    open_overlay_view(&ov, &mut st, &state_open, !as_list, idx, false);
                     if let Ok(h) = std::env::var("NOKEYS_HOVER") {
                         if let Ok(h) = h.parse::<i32>() {
                             ov.set_hovered(h);
@@ -617,6 +661,9 @@ fn grid_index_at(x: f32, y: f32, st: &AppState) -> i32 {
     idx as i32
 }
 
+/// Sector the pointer points at. Only the direction from the disc centre counts:
+/// distance just decides whether a direction was picked at all, so a fast push
+/// that overshoots the rim still selects the sector it started heading for.
 fn wheel_sector_at(x: f32, y: f32, st: &AppState) -> i32 {
     let items = &st.config.wheels[st.current_wheel].items;
     let n = items.len();
@@ -626,7 +673,7 @@ fn wheel_sector_at(x: f32, y: f32, st: &AppState) -> i32 {
     let dx = x - DISC_CX;
     let dy = y - DISC_CY;
     let dist = (dx * dx + dy * dy).sqrt();
-    if dist > DISC_R || dist < HUB_R {
+    if dist < DIR_DEAD_ZONE {
         return -1;
     }
     let ang = dy.atan2(dx).to_degrees();
@@ -651,7 +698,19 @@ fn handle_event(ev: HotkeyEvent, ov: &OverlayWindow, state: &Arc<Mutex<AppState>
                 return;
             }
             ntrace!("trigger down");
-            open_overlay(ov, &mut st);
+            open_overlay(ov, &mut st, state);
+        }
+        HotkeyEvent::Moved => {
+            // Direction-only picking: the highlight has to follow the pointer
+            // everywhere, including outside the overlay window.
+            if !st.open {
+                return;
+            }
+            let idx = item_index_at_cursor(&st);
+            if idx != st.hovered {
+                st.hovered = idx;
+                ov.set_hovered(idx);
+            }
         }
         HotkeyEvent::Up => {
             if !st.open {
@@ -660,9 +719,13 @@ fn handle_event(ev: HotkeyEvent, ov: &OverlayWindow, state: &Arc<Mutex<AppState>
             // Releasing without moving means "cancel": the wheel is anchored at
             // the cursor, and when it had to be clamped to stay on screen the
             // pointer no longer sits on the centre either.
-            let cursor = get_cursor_pos();
-            let (ox, oy) = st.open_cursor;
-            let moved = (cursor.0 - ox).abs().max((cursor.1 - oy).abs()) >= 10;
+            // Releasing without pushing anywhere is a cancel. A pinned wheel
+            // already has its own dead zone, measured on the push vector.
+            let moved = st.pinned || {
+                let cursor = get_cursor_pos();
+                let (ox, oy) = st.open_cursor;
+                (cursor.0 - ox).abs().max((cursor.1 - oy).abs()) >= 10
+            };
             let id = if moved { item_at_cursor(&st) } else { None };
             ntrace!("trigger up -> {:?} (moved={moved})", id);
             // Releasing over an item runs it; over nothing it just closes, and
@@ -866,6 +929,119 @@ struct Chord {
     shift: bool,
     win: bool,
     vk: u16,
+}
+
+/// Round-trip checks for the shortcut binding text, run with NOKEYS_SELFTEST=1.
+#[cfg(debug_assertions)]
+fn chord_selftest() -> Vec<(&'static str, bool)> {
+    let hk = |ctrl, alt, shift, win, key| config::Hotkey {
+        ctrl,
+        alt,
+        shift,
+        win,
+        key,
+        mouse: 0,
+    };
+    let round = |h: config::Hotkey| {
+        let text = chord_text(&h).expect("keyboard chord");
+        let back = parse_chord(&text).expect("parse back");
+        (
+            text.clone(),
+            back.ctrl == h.ctrl
+                && back.alt == h.alt
+                && back.shift == h.shift
+                && back.win == h.win
+                && back.vk as u32 == h.key,
+        )
+    };
+    let mut out = Vec::new();
+    let (text, ok) = round(hk(true, true, false, false, 0x4d));
+    out.push(("chord text: ctrl+alt+M", ok && text == "Ctrl+Alt+M"));
+    let (text, ok) = round(hk(false, false, false, false, 0x77));
+    out.push(("chord text: bare F8", ok && text == "F8"));
+    let (text, ok) = round(hk(false, false, true, false, 0xba));
+    out.push(("chord text: shift+;", ok && text == "Shift+;"));
+    let (text, ok) = round(hk(false, false, false, false, 0x64));
+    out.push(("chord text: numpad 4", ok && text == "Num4"));
+    out.push((
+        "chord text: mouse button refused",
+        chord_text(&config::Hotkey {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            win: false,
+            key: 0,
+            mouse: 6,
+        })
+        .is_none(),
+    ));
+    out
+}
+
+/// Text for a captured chord that parse_chord reads back (None for mouse
+/// buttons: no key injection can send those, and the caller explains why).
+fn chord_text(h: &config::Hotkey) -> Option<String> {
+    if h.mouse != 0 {
+        return None;
+    }
+    let key = key_text(h.key as u16)?;
+    let mut parts: Vec<&str> = Vec::new();
+    if h.ctrl {
+        parts.push("Ctrl");
+    }
+    if h.alt {
+        parts.push("Alt");
+    }
+    if h.shift {
+        parts.push("Shift");
+    }
+    if h.win {
+        parts.push("Win");
+    }
+    if parts.is_empty() {
+        Some(key)
+    } else {
+        Some(format!("{}+{key}", parts.join("+")))
+    }
+}
+
+/// Inverse of vk_from_name, limited to what a chord may contain.
+fn key_text(vk: u16) -> Option<String> {
+    Some(match vk {
+        0x30..=0x39 | 0x41..=0x5a => ((vk as u8) as char).to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x6f),
+        0x60..=0x69 => format!("Num{}", vk - 0x60),
+        0x20 => "Space".into(),
+        0x09 => "Tab".into(),
+        0x0d => "Enter".into(),
+        0x1b => "Esc".into(),
+        0x08 => "Backspace".into(),
+        0x2d => "Insert".into(),
+        0x2e => "Delete".into(),
+        0x24 => "Home".into(),
+        0x23 => "End".into(),
+        0x21 => "PageUp".into(),
+        0x22 => "PageDown".into(),
+        0x25 => "Left".into(),
+        0x26 => "Up".into(),
+        0x27 => "Right".into(),
+        0x28 => "Down".into(),
+        0x14 => "CapsLock".into(),
+        0x2c => "PrintScreen".into(),
+        0x13 => "Pause".into(),
+        0xba => ";".into(),
+        0xbb => "=".into(),
+        0xbc => ",".into(),
+        0xbd => "-".into(),
+        0xbe => ".".into(),
+        0xbf => "/".into(),
+        0xc0 => "`".into(),
+        0xdb => "[".into(),
+        0xdc => "\\".into(),
+        0xdd => "]".into(),
+        0xde => "'".into(),
+        _ => return None,
+    })
 }
 
 /// Parse chords like "Ctrl+Alt+M", "F8" or "Shift+Space".
@@ -1160,14 +1336,14 @@ fn type_text(text: &str) {
     }
 }
 
-fn open_overlay(ov: &OverlayWindow, st: &mut AppState) {
+fn open_overlay(ov: &OverlayWindow, st: &mut AppState, state: &Arc<Mutex<AppState>>) {
     let (view_is_wheel, wheel_idx) = match &st.config.route {
         Route::List => (false, st.current_wheel),
         Route::Wheel(i) => (true, (*i).min(st.config.wheels.len().saturating_sub(1))),
     };
     // Opened by the hotkey: the keyboard belongs to the overlay until the key is
     // released, which is what makes releasing without moving a no-op.
-    open_overlay_view(ov, st, view_is_wheel, wheel_idx, true);
+    open_overlay_view(ov, st, state, view_is_wheel, wheel_idx, true);
 }
 
 /// Opens the overlay. "by_hotkey" decides whether the keyboard is taken away
@@ -1175,6 +1351,7 @@ fn open_overlay(ov: &OverlayWindow, st: &mut AppState) {
 fn open_overlay_view(
     ov: &OverlayWindow,
     st: &mut AppState,
+    state: &Arc<Mutex<AppState>>,
     view_is_wheel: bool,
     wheel_idx: usize,
     by_hotkey: bool,
@@ -1218,6 +1395,14 @@ fn open_overlay_view(
     st.overlay_scale = scale;
     st.open_cursor = cursor;
 
+    // A game keeps the cursor glued to the middle of its window and reads the
+    // offset itself, so the pointer has to be taken over while the wheel is up:
+    // the cursor is held on this point (the game polls a standstill) and the
+    // movement is collected by the hook instead. The list view keeps the real
+    // cursor, it is a grid to point at.
+    st.pinned = view_is_wheel && by_hotkey;
+    hotkey::set_pin_point(if st.pinned { Some(cursor) } else { None });
+
     ov.window()
         .set_size(PhysicalSize::new(w_phys.max(1) as u32, h_phys.max(1) as u32));
     ov.window().set_position(PhysicalPosition::new(px, py));
@@ -1242,6 +1427,7 @@ fn open_overlay_view(
     };
     let _ = ov.show();
     make_overlay_non_activating();
+    exclude_overlay_from_capture();
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
         // The very first ShowWindow activates the overlay before the extended
@@ -1264,11 +1450,20 @@ fn open_overlay_view(
             ov.set_reveal(true);
         }
     });
+
+    // The disc frost is re-captured while the wheel is up: a game keeps drawing
+    // behind it, and a frozen snapshot reads as a bug. Only when the window is
+    // really hidden from captures, or the wheel would film itself.
+    if view_is_wheel && exclude_overlay_from_capture() {
+        start_live_backdrop(ov.as_weak(), state.clone(), gen);
+    }
 }
 
 fn close_overlay(ov: &OverlayWindow, st: &mut AppState) {
     st.open = false;
     st.hovered = -1;
+    st.pinned = false;
+    hotkey::set_pin_point(None);
     hotkey::set_overlay_engaged(false);
     ov.set_reveal(false);
     ov.set_hovered(-1);
@@ -1340,7 +1535,7 @@ fn switch_to_list_view(ov: &OverlayWindow, state: &Arc<Mutex<AppState>>) {
             return;
         }
         let wheel = st.current_wheel;
-        open_overlay_view(&ov, &mut st, false, wheel, false);
+        open_overlay_view(&ov, &mut st, &st2, false, wheel, false);
     });
 }
 
@@ -1353,26 +1548,42 @@ fn list_window_size(st: &AppState) -> (f32, f32) {
     (w, h)
 }
 
-fn item_at_cursor(st: &AppState) -> Option<i32> {
-    let (ox, oy) = st.overlay_origin;
+/// Index of the wheel sector or list cell the pointer currently points at.
+fn item_index_at_cursor(st: &AppState) -> i32 {
     let scale = st.overlay_scale.max(0.1);
+    if st.pinned {
+        // Direction pushed since the wheel opened, as if the cursor had moved.
+        let (px, py) = hotkey::push_vector();
+        return wheel_sector_at(
+            DISC_CX + px as f32 / scale,
+            DISC_CY + py as f32 / scale,
+            st,
+        );
+    }
+    let (ox, oy) = st.overlay_origin;
     let cursor = get_cursor_pos();
     let rel_x = (cursor.0 - ox) as f32 / scale;
     let rel_y = (cursor.1 - oy) as f32 / scale;
-
     if st.view_is_wheel {
-        let idx = wheel_sector_at(rel_x, rel_y, st);
-        if idx < 0 {
-            return None;
-        }
-        return Some(st.config.wheels[st.current_wheel].items[idx as usize].id as i32);
+        wheel_sector_at(rel_x, rel_y, st)
+    } else {
+        grid_index_at(rel_x, rel_y, st)
     }
+}
 
-    let idx = grid_index_at(rel_x, rel_y, st);
+fn item_at_cursor(st: &AppState) -> Option<i32> {
+    let idx = item_index_at_cursor(st);
     if idx < 0 {
         return None;
     }
-    st.list_ids.get(idx as usize).copied().map(|id| id as i32)
+    if st.view_is_wheel {
+        st.config.wheels[st.current_wheel]
+            .items
+            .get(idx as usize)
+            .map(|it| it.id as i32)
+    } else {
+        st.list_ids.get(idx as usize).copied().map(|id| id as i32)
+    }
 }
 
 // ================= platform helpers =================
@@ -1413,6 +1624,43 @@ fn clamp_to_work_area(px: i32, py: i32, w: i32, h: i32, cx: i32, cy: i32) -> (i3
 /// Keep the overlay out of the taskbar / alt-tab and, more importantly, stop it
 /// from stealing activation: the application the user was working in must keep
 /// focus, otherwise the keystroke they release into it goes nowhere.
+/// Keep the overlay out of screen captures, so the live backdrop never films
+/// the wheel it is painting behind. Windows 10 2004+ only; older systems keep the
+/// frozen snapshot because capturing themselves would recurse.
+fn exclude_overlay_from_capture() -> bool {
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowDisplayAffinity, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+    };
+    // 0 = not tried yet, 1 = hidden from captures, 2 = not possible on this system
+    static RESULT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    match RESULT.load(Ordering::SeqCst) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    // Escape hatch for screen shots taken by the developer, where the wheel has
+    // to be visible even though that makes the backdrop recursive.
+    if std::env::var_os("NOKEYS_CAPTURE_VISIBLE").is_some() {
+        RESULT.store(2, Ordering::SeqCst);
+        ntrace!("overlay capture exclusion off (NOKEYS_CAPTURE_VISIBLE)");
+        return false;
+    }
+    let Ok(hwnd) = (unsafe { FindWindowW(None, w!("NoKeys Overlay")) }) else {
+        return false;
+    };
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let set = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
+    let mut got: u32 = 0;
+    let read = unsafe { GetWindowDisplayAffinity(hwnd, &mut got) };
+    let ok = set.is_ok() && read.is_ok() && got == WDA_EXCLUDEFROMCAPTURE.0;
+    RESULT.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
+    ntrace!("overlay capture exclusion: {ok}");
+    ok
+}
+
 fn make_overlay_non_activating() {
     use windows::core::w;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -1446,6 +1694,8 @@ fn make_overlay_non_activating() {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
+        // The hook needs to know which window is ours to keep clicks inside it.
+        hotkey::set_overlay_hwnd(hwnd.0 as isize);
     }
     STYLED.store(1, Ordering::SeqCst);
     ntrace!("overlay window marked non-activating");
@@ -1525,6 +1775,52 @@ fn vk_name(vk: u32) -> String {
 }
 
 /// Capture + blur the desktop behind the disc and hand it to the UI as a texture.
+/// Screen pixels collapsed into one: the frost hides the missing detail, and the
+/// blur work drops by this factor squared, which is what makes 25 fps affordable.
+const BACKDROP_DIV: i32 = 2;
+/// Interval between live backdrop frames.
+const BACKDROP_FRAME_MS: u64 = 33;
+
+/// Capture + blur the region under the disc, ready to be painted inside it.
+fn render_backdrop(
+    config: &Config,
+    px: i32,
+    py: i32,
+    w_phys: i32,
+    h_phys: i32,
+    scale: f32,
+) -> Option<slint::Image> {
+    // Disc box in device coords inside the window.
+    let dx = (DISC_X * scale).round() as i32;
+    let dy = (DISC_Y * scale).round() as i32;
+    let dw = (DISC_D * scale).round() as i32;
+
+    let mut shot = backdrop::capture_shrunk(
+        px + dx,
+        py + dy,
+        dw.min(w_phys),
+        dw.min(h_phys),
+        BACKDROP_DIV,
+    )?;
+    // Exclusive fullscreen and protected output come back as an empty frame; the
+    // caller keeps the last good one instead of flashing black.
+    if backdrop::is_blank(&shot) {
+        return None;
+    }
+    // strength 0..1 -> blur radius 0..~10 device px (3 box passes ~ gaussian)
+    let radius = (config.blur.strength.clamp(0.0, 1.0) * 10.0 * scale
+        / BACKDROP_DIV as f32)
+        .round() as u32;
+    backdrop::blur(&mut shot, radius);
+
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &shot.pixels,
+        shot.width,
+        shot.height,
+    );
+    Some(slint::Image::from_rgba8(buffer))
+}
+
 fn apply_backdrop(
     ov: &OverlayWindow,
     config: &Config,
@@ -1540,29 +1836,62 @@ fn apply_backdrop(
         ov.set_disc_image_set(false);
         return;
     }
-    // Disc box in device coords inside the window.
-    let dx = (DISC_X * scale).round() as i32;
-    let dy = (DISC_Y * scale).round() as i32;
-    let dw = (DISC_D * scale).round() as i32;
+    match render_backdrop(config, px, py, w_phys, h_phys, scale) {
+        Some(image) => {
+            ov.set_disc_image(image);
+            ov.set_disc_image_set(true);
+        }
+        None => {
+            ntrace!("backdrop capture failed");
+            ov.set_disc_image_set(false);
+        }
+    }
+}
 
-    let captured = backdrop::capture(px + dx, py + dy, dw.min(w_phys), dw.min(h_phys));
-    let Some(mut shot) = captured else {
-        ov.set_disc_image_set(false);
-        ntrace!("backdrop capture failed");
+/// One live frame: re-frost the desktop under the disc and re-arm until the
+/// overlay closes (the generation counter changes on every open/close).
+fn backdrop_tick(ov: slint::Weak<OverlayWindow>, state: Arc<Mutex<AppState>>, gen: u64) {
+    if OVERLAY_GEN.load(Ordering::SeqCst) != gen {
+        return;
+    }
+    let Some(ov) = ov.upgrade() else {
         return;
     };
+    // Copy what the capture needs, then drop the lock: capturing with the state
+    // locked would stall every other caller for a few milliseconds.
+    let (config, origin, scale) = {
+        let st = state.lock().unwrap();
+        if !st.open || !st.view_is_wheel {
+            return;
+        }
+        if !st.config.blur.enabled || st.config.blur.strength <= 0.01 {
+            return;
+        }
+        (st.config.clone(), st.overlay_origin, st.overlay_scale)
+    };
+    let size = ov.window().size();
+    if let Some(image) = render_backdrop(
+        &config,
+        origin.0,
+        origin.1,
+        size.width as i32,
+        size.height as i32,
+        scale,
+    ) {
+        ov.set_disc_image(image);
+        ov.set_disc_image_set(true);
+    }
+    let weak = ov.as_weak();
+    let next = state.clone();
+    slint::Timer::single_shot(std::time::Duration::from_millis(BACKDROP_FRAME_MS), move || {
+        backdrop_tick(weak, next, gen)
+    });
+}
 
-    // strength 0..1 -> blur radius 0..~10 device px (3 box passes ~ gaussian)
-    let radius = (config.blur.strength.clamp(0.0, 1.0) * 10.0 * scale).round() as u32;
-    backdrop::blur(&mut shot, radius);
-
-    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-        &shot.pixels,
-        shot.width,
-        shot.height,
-    );
-    ov.set_disc_image(slint::Image::from_rgba8(buffer));
-    ov.set_disc_image_set(true);
+fn start_live_backdrop(ov: slint::Weak<OverlayWindow>, state: Arc<Mutex<AppState>>, gen: u64) {
+    slint::Timer::single_shot(std::time::Duration::from_millis(BACKDROP_FRAME_MS), move || {
+        backdrop_tick(ov, state, gen)
+    });
 }
 
 // ================= single instance =================

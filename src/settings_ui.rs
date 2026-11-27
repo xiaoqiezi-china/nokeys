@@ -46,6 +46,9 @@ pub fn sync_settings(settings: &SettingsWindow, state: &Arc<Mutex<AppState>>) {
 
     settings.set_data_dir(config::config_dir().display().to_string().into());
     settings.set_capturing(st.capturing);
+    // -1 = no item is binding a shortcut
+    settings.set_capture_wheel(st.capture_item.map(|(w, _)| w as i32).unwrap_or(-1));
+    settings.set_capture_slot(st.capture_item.map(|(_, s)| s as i32).unwrap_or(-1));
 }
 
 fn build_edit_items(cfg: &Config) -> Vec<EditItem> {
@@ -164,7 +167,12 @@ pub fn wire_settings(
         // Always *start* capturing (never toggle): a duplicated click event must not
         // cancel the capture it just started.
         settings.on_request_capture(move || {
-            st.lock().unwrap().capturing = true;
+            {
+                let mut s_ = st.lock().unwrap();
+                s_.capturing = true;
+                // Retarget: a pending item bind must not swallow this chord.
+                s_.capture_item = None;
+            }
             hotkey::set_capturing(true);
             ntrace!("request_capture -> capturing=true");
             if let Some(se) = sw.upgrade() {
@@ -177,10 +185,34 @@ pub fn wire_settings(
         let st = state.clone();
         let sw = settings.as_weak();
         settings.on_cancel_capture(move || {
-            st.lock().unwrap().capturing = false;
+            {
+                let mut s_ = st.lock().unwrap();
+                s_.capturing = false;
+                s_.capture_item = None;
+            }
             hotkey::set_capturing(false);
             ntrace!("cancel_capture");
             if let Some(se) = sw.upgrade() {
+                sync_settings(&se, &st);
+            }
+        });
+    }
+
+    {
+        // Bind the next captured chord to one item instead of the global hotkey.
+        let st = state.clone();
+        let sw = settings.as_weak();
+        settings.on_bind_item_shortcut(move |wheel: i32, slot: i32| {
+            if let Some(se) = sw.upgrade() {
+                let (wi, si) = (wheel.max(0) as usize, slot.max(0) as usize);
+                {
+                    let mut s_ = st.lock().unwrap();
+                    s_.capturing = true;
+                    s_.capture_item = Some((wi, si));
+                }
+                hotkey::set_capturing(true);
+                se.set_capture_hint("".into());
+                ntrace!("bind item shortcut {wi}/{si}");
                 sync_settings(&se, &st);
             }
         });
