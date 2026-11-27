@@ -1,6 +1,6 @@
 [package]
 name = "nokeys"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Windows 全局轮盘 / 列表快捷启动器"
 authors = ["xiaoqie"]

@@ -1,15 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Windows Installer package for NoKeys.
 
-     Installs per machine into Program Files\NoKeys, creates a Start Menu entry
-     and a desktop shortcut, registers the usual "apps and features" entry and
-     removes everything again on uninstall. The user's settings in
-     %APPDATA%\NoKeys are deliberately left alone. -->
+     Per-machine install into Program Files\NoKeys plus shortcuts in the all-users
+     Start Menu and desktop. The shortcuts are plain .lnk files pointing straight
+     at the executable (advertised shortcuts depend on the MSI database being
+     healthy and give no icon control). Settings in %APPDATA%\NoKeys survive an
+     uninstall. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
            Name="NoKeys"
            Language="2052"
-           Version="1.0.0"
+           Version="1.0.1"
            Manufacturer="NoKeys"
            UpgradeCode="7E4C1F52-9A3B-4D6E-8C21-5F0B7A6D93C4">
 
@@ -35,41 +36,55 @@
       <Directory Id="ProgramFiles64Folder">
         <Directory Id="INSTALLFOLDER" Name="NoKeys" />
       </Directory>
-      <Directory Id="ProgramMenuFolder">
+      <Directory Id="CommonProgramsFolder">
         <Directory Id="AppMenuFolder" Name="NoKeys" />
       </Directory>
-      <Directory Id="DesktopFolder" />
+      <Directory Id="CommonDesktopFolder" />
     </Directory>
 
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="MainExecutable" Guid="*">
         <File Id="NoKeysExe"
               Source="..\target\release\nokeys.exe"
-              KeyPath="yes">
-          <Shortcut Id="StartMenuShortcut"
-                    Directory="AppMenuFolder"
-                    Name="NoKeys"
-                    Description="Windows 全局轮盘快捷启动器"
-                    WorkingDirectory="INSTALLFOLDER"
-                    Advertise="yes" />
-          <Shortcut Id="DesktopShortcut"
-                    Directory="DesktopFolder"
-                    Name="NoKeys"
-                    Description="Windows 全局轮盘快捷启动器"
-                    WorkingDirectory="INSTALLFOLDER"
-                    Advertise="yes" />
-        </File>
-        <!-- the Start Menu folder is ours alone, so uninstall has to remove it -->
-        <RemoveFolder Id="AppMenuFolderRemove" Directory="AppMenuFolder" On="uninstall" />
+              KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Shortcuts live in per-machine folders and point at the executable, so the
+         icon is the one embedded in it. Their own component keeps the key path
+         (the icon file) away from the executable component. -->
+    <DirectoryRef Id="AppMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <Shortcut Id="StartMenuLnk"
+                  Name="NoKeys"
+                  Description="Windows 全局轮盘快捷启动器"
+                  Target="[INSTALLFOLDER]NoKeys.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon" />
+        <RemoveFolder Id="AppMenuFolderRemove" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\NoKeys.exe" Name="Path" Type="string" Value="[INSTALLFOLDER]NoKeys.exe" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="CommonDesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Shortcut Id="DesktopLnk"
+                  Name="NoKeys"
+                  Description="Windows 全局轮盘快捷启动器"
+                  Target="[INSTALLFOLDER]NoKeys.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\NoKeys.exe" Name="Desktop" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
     <Feature Id="Main" Title="NoKeys" Level="1" Absent="disallow">
       <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
-    <!-- Start the tray app once the files are in place; Impersonate keeps it in
-         the installing user's session instead of the elevated one. -->
+    <!-- Start the tray app once the files are in place. -->
     <CustomAction Id="LaunchApp"
                   FileKey="NoKeysExe"
                   ExeCommand=""
